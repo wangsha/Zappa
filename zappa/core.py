@@ -1097,6 +1097,7 @@ class Zappa:
         runtime="python3.8",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
+        snap_start=None,
         xray_tracing=False,
         local_zip=None,
         use_alb=False,
@@ -1137,6 +1138,7 @@ class Zappa:
             Environment={"Variables": aws_environment_variables},
             KMSKeyArn=aws_kms_key_arn,
             TracingConfig={"Mode": "Active" if self.xray_tracing else "PassThrough"},
+            SnapStart={'ApplyOn': snap_start if snap_start else 'None'},
             Layers=layers,
             Architectures=architecture,
         )
@@ -1289,6 +1291,7 @@ class Zappa:
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         layers=None,
+        snap_start=None,
         wait=True,
         architecture=None,
     ):
@@ -1332,6 +1335,7 @@ class Zappa:
             "Environment": {"Variables": aws_environment_variables},
             "KMSKeyArn": aws_kms_key_arn,
             "TracingConfig": {"Mode": "Active" if self.xray_tracing else "PassThrough"},
+            "SnapStart": {'ApplyOn': snap_start if snap_start else "None"}
         }
 
         if lambda_aws_config.get("PackageType", None) != "Image":
