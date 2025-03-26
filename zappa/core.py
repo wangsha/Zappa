@@ -493,7 +493,7 @@ class Zappa:
         # This is the recommended method for installing packages if you don't
         # to depend on `setuptools`
         # https://github.com/pypa/pip/issues/5240#issuecomment-381662679
-        pip_process = subprocess.Popen(command, stdout=subprocess.PIPE)
+        pip_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # Using communicate() to avoid deadlocks
         stdout_result, stderror_result = pip_process.communicate()
         pip_return_code = pip_process.returncode
@@ -1138,7 +1138,7 @@ class Zappa:
             Environment={"Variables": aws_environment_variables},
             KMSKeyArn=aws_kms_key_arn,
             TracingConfig={"Mode": "Active" if self.xray_tracing else "PassThrough"},
-            SnapStart={'ApplyOn': snap_start if snap_start else 'None'},
+            SnapStart={"ApplyOn": snap_start if snap_start else "None"},
             Layers=layers,
             Architectures=architecture,
         )
@@ -1335,7 +1335,7 @@ class Zappa:
             "Environment": {"Variables": aws_environment_variables},
             "KMSKeyArn": aws_kms_key_arn,
             "TracingConfig": {"Mode": "Active" if self.xray_tracing else "PassThrough"},
-            "SnapStart": {'ApplyOn': snap_start if snap_start else "None"}
+            "SnapStart": {"ApplyOn": snap_start if snap_start else "None"},
         }
 
         if lambda_aws_config.get("PackageType", None) != "Image":
