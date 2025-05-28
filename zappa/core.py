@@ -14,6 +14,7 @@ import re
 import shutil
 import string
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -280,7 +281,7 @@ class Zappa:
         load_credentials=True,
         desired_role_name=None,
         desired_role_arn=None,
-        runtime="python3.8",  # Detected at runtime in CLI
+        runtime="python3.13",  # Detected at runtime in CLI
         tags=(),
         endpoint_urls={},
         xray_tracing=False,
@@ -321,7 +322,7 @@ class Zappa:
         self.manylinux_wheel_abi3_file_match = re.compile(
             f'^.*cp3.-abi3-manylinux({"|".join(self.manylinux_suffixes)})_{self.architecture}.whl$'
         )
-        self.manylinux_wheel_abi3_file_match = re.compile(rf"^.*cp3.-abi3-manylinux.*_x86_64[.]whl$")
+        self.manylinux_wheel_abi3_file_match = re.compile(r"^.*cp3.-abi3-manylinux.*_x86_64[.]whl$")
 
         self.endpoint_urls = endpoint_urls
         self.xray_tracing = xray_tracing
@@ -450,7 +451,7 @@ class Zappa:
         # Make a new folder for the handler packages
         ve_path = os.path.join(os.getcwd(), "handler_venv")
 
-        if os.sys.platform == "win32":
+        if sys.platform == "win32":
             current_site_packages_dir = os.path.join(current_venv, "Lib", "site-packages")
             venv_site_packages_dir = os.path.join(ve_path, "Lib", "site-packages")
         else:
@@ -500,9 +501,9 @@ class Zappa:
 
         if pip_return_code:
             logger.info("command: %s", " ".join(command))
-            if stdout_result.strip():
+            if stdout_result and stdout_result.strip():
                 logger.info("stdout: %s", stdout_result.strip())
-            if stderror_result.strip():
+            if stderror_result and stderror_result.strip():
                 logger.error("stderr: %s", stderror_result)
             raise EnvironmentError("Pypi lookup failed")
 
@@ -661,7 +662,7 @@ class Zappa:
         # Then, do site site-packages..
         egg_links = []
         temp_package_path = tempfile.mkdtemp(prefix="zappa-packages")
-        if os.sys.platform == "win32":
+        if sys.platform == "win32":
             site_packages = os.path.join(venv, "Lib", "site-packages")
         else:
             site_packages = os.path.join(venv, "lib", get_venv_from_python_version(), "site-packages")
@@ -764,12 +765,12 @@ class Zappa:
                 # we can skip the python source code as we'll just
                 # use the compiled bytecode anyway..
                 if filename[-3:] == ".py" and root[-10:] != "migrations":
-                    abs_filname = os.path.join(root, filename)
-                    abs_pyc_filename = abs_filname + "c"
+                    abs_filename = os.path.join(root, filename)
+                    abs_pyc_filename = abs_filename + "c"
                     if os.path.isfile(abs_pyc_filename):
                         # but only if the pyc is older than the py,
                         # otherwise we'll deploy outdated code!
-                        py_time = os.stat(abs_filname).st_mtime
+                        py_time = os.stat(abs_filename).st_mtime
                         pyc_time = os.stat(abs_pyc_filename).st_mtime
 
                         if pyc_time > py_time:
@@ -887,7 +888,7 @@ class Zappa:
             os.makedirs(cached_wheels_dir)
         else:
             # Check if we already have a cached copy
-            wheel_name = re.sub(r"[^\w\d.]+", "_", package_name, re.UNICODE)
+            wheel_name = re.sub(r"[^\w\d.]+", "_", package_name, flags=re.UNICODE)
             wheel_file = f"{wheel_name}-{package_version}-*_x86_64.whl"
             wheel_path = os.path.join(cached_wheels_dir, wheel_file)
 
@@ -1094,7 +1095,7 @@ class Zappa:
         publish=True,
         vpc_config=None,
         dead_letter_config=None,
-        runtime="python3.8",
+        runtime="python3.13",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         snap_start=None,
@@ -1287,7 +1288,7 @@ class Zappa:
         ephemeral_storage={"Size": 512},
         publish=True,
         vpc_config=None,
-        runtime="python3.8",
+        runtime="python3.13",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         layers=None,

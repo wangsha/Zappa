@@ -228,7 +228,6 @@ class TestZappa(unittest.TestCase):
         """
         Ensure that response body is base64 encoded when BINARY_SUPPORT is enabled and Content-Encoding header is present.
         """
-
         lh = LambdaHandler("tests.test_binary_support_settings")
 
         text_plain_event = {
@@ -286,7 +285,6 @@ class TestZappa(unittest.TestCase):
         """
         Ensure zappa response bodies are NOT base64 encoded when BINARY_SUPPORT is enabled and the mimetype is "application/json" or starts with "text/".
         """
-
         lh = LambdaHandler("tests.test_binary_support_settings")
 
         text_plain_event = {
@@ -321,7 +319,6 @@ class TestZappa(unittest.TestCase):
         """
         Ensure zappa response bodies are base64 encoded when BINARY_SUPPORT is enabled and Content-Encoding is absent.
         """
-
         lh = LambdaHandler("tests.test_binary_support_settings")
 
         text_plain_event = {
@@ -588,7 +585,7 @@ class TestZappa(unittest.TestCase):
         event = {
             "version": "2.0",
             "routeKey": "$default",
-            "rawPath": "/",
+            "rawPath": "/return/request/url",
             "rawQueryString": "",
             "headers": {
                 "host": "1234567890.execute-api.us-east-1.amazonaws.com",
