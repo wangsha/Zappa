@@ -22,7 +22,7 @@ import zipfile
 from builtins import bytes, int
 from io import open
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import boto3
 import botocore
@@ -239,10 +239,44 @@ ZIP_EXCLUDES = [
 # the Lambda.
 # See: https://github.com/Miserlou/Zappa/pull/1730
 ALB_LAMBDA_ALIAS = "current-alb-version"
+X86_ARCHITECTURE = "x86_64"
+ARM_ARCHITECTURE = "arm64"
+VALID_ARCHITECTURES = (X86_ARCHITECTURE, ARM_ARCHITECTURE)
 
-##
-# Classes
-##
+
+def build_manylinux_wheel_file_match_pattern(runtime: str, architecture: str) -> re.Pattern:
+    # Support PEP600 (https://peps.python.org/pep-0600/)
+    # The wheel filename is {distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl
+    runtime_major_version, runtime_minor_version = runtime[6:].split(".")
+    python_tag = f"cp{runtime_major_version}{runtime_minor_version}"  # python3.13 -> cp313
+    manylinux_legacy_tags = ("manylinux2014", "manylinux2010", "manylinux1")
+    if architecture == X86_ARCHITECTURE:
+        valid_platform_tags = [X86_ARCHITECTURE]
+    elif architecture == ARM_ARCHITECTURE:
+        valid_platform_tags = [ARM_ARCHITECTURE, "aarch64"]
+    else:
+        raise ValueError(f"Invalid 'architecture', must be one of {VALID_ARCHITECTURES}, got: {architecture}")
+
+    manylinux_wheel_file_match = (
+        rf'^.*{python_tag}-(manylinux_\d+_\d+_({"|".join(valid_platform_tags)})[.])?'
+        rf'({"|".join(manylinux_legacy_tags)})_({"|".join(valid_platform_tags)})[.]whl$'
+    )
+
+    # The 'abi3' tag is a compiled distribution format designed for compatibility across multiple Python 3 versions.
+    # An abi3 wheel is built against the stable ABI (Application Binary Interface) of a minimum supported Python version.
+    # -- make sure cp3XX version is <= to the runtime version (runtime_minor_version)
+    minimum_minor_version = 5
+    abi_valid_python_minor_versions = [str(i) for i in range(minimum_minor_version, int(runtime_minor_version) + 1)]
+    manylinux_suffixes = [r"_\d+_\d+", r"manylinux_\d+_\d+"]
+    manylinux_suffixes.extend(manylinux_legacy_tags)
+    manylinux_wheel_abi3_file_match = (
+        # rf'^.*cp3.-abi3-manylinux({"|".join(manylinux_suffixes)})_({"|".join(valid_platform_tags)}).whl$'
+        rf'^.*cp3({"|".join(abi_valid_python_minor_versions)})-abi3-'
+        rf'manylinux(({"|".join(manylinux_suffixes)})_({"".join(valid_platform_tags)})(\.|))+.whl$'
+    )
+    combined_match_pattern = rf"({manylinux_wheel_file_match})|({manylinux_wheel_abi3_file_match})"
+    manylinux_wheel_file_match_pattern = re.compile(combined_match_pattern)
+    return manylinux_wheel_file_match_pattern
 
 
 class Zappa:
@@ -263,7 +297,7 @@ class Zappa:
     apigateway_policy = None
     cloudwatch_log_levels = ["OFF", "ERROR", "INFO"]
     xray_tracing = False
-
+    architecture = None
     ##
     # Credentials
     ##
@@ -283,6 +317,7 @@ class Zappa:
         tags=(),
         endpoint_urls={},
         xray_tracing=False,
+        architecture=None,
     ):
         """
         Instantiate this new Zappa instance, loading any custom credentials if necessary.
@@ -304,14 +339,14 @@ class Zappa:
 
         self.runtime = runtime
 
-        # TODO: Support PEP600 properly (https://peps.python.org/pep-0600/)
-        self.manylinux_suffix_start = f"cp{self.runtime[6:].replace('.', '')}"
-        self.manylinux_suffixes = ("_2_24", "2014", "2010", "1")
-        # TODO: Support aarch64 architecture
-        self.manylinux_wheel_file_match = re.compile(
-            rf'^.*{self.manylinux_suffix_start}-(manylinux_\d+_\d+_x86_64[.])?manylinux({"|".join(self.manylinux_suffixes)})_x86_64[.]whl$'  # noqa: E501
-        )
-        self.manylinux_wheel_abi3_file_match = re.compile(r"^.*cp3.-abi3-manylinux.*_x86_64[.]whl$")
+        if not architecture:
+            architecture = X86_ARCHITECTURE
+        if architecture not in VALID_ARCHITECTURES:
+            raise ValueError(f"Invalid architecture '{architecture}'. Must be one of: {VALID_ARCHITECTURES}")
+
+        self.architecture = architecture
+
+        self.manylinux_wheel_file_match = build_manylinux_wheel_file_match_pattern(runtime, architecture)
 
         self.endpoint_urls = endpoint_urls
         self.xray_tracing = xray_tracing
@@ -389,42 +424,46 @@ class Zappa:
     # Packaging
     ##
 
-    def copy_editable_packages(self, egg_links, temp_package_path):
-        """ """
+    def copy_editable_packages(self, egg_links: list[Path], temp_package_path: Path):
+        """
+        Reads the first line of each egg-link file, which contains the path to the package,
+        copies the package contents to the temporary package path, then removes the egg-link files.
+        """
         for egg_link in egg_links:
-            with open(egg_link, "rb") as df:
-                egg_path = df.read().decode("utf-8").splitlines()[0].strip()
-                pkgs = set([x.split(".")[0] for x in find_packages(egg_path, exclude=["test", "tests"])])
+            with egg_link.open("rb") as df:
+                egg_path: str = df.read().decode("utf-8").splitlines()[0].strip()
+                pkgs = set(x.split(".")[0] for x in find_packages(egg_path, exclude=["test", "tests"]))
                 for pkg in pkgs:
+                    egg_package_path = Path(egg_path) / pkg
                     copytree(
-                        os.path.join(egg_path, pkg),
-                        os.path.join(temp_package_path, pkg),
+                        str(egg_package_path.resolve()),
+                        str(temp_package_path / pkg),
                         metadata=False,
                         symlinks=False,
                     )
 
         if temp_package_path:
             # now remove any egg-links as they will cause issues if they still exist
-            for link in glob.glob(os.path.join(temp_package_path, "*.egg-link")):
-                os.remove(link)
+            for link in temp_package_path.glob("*.egg-link"):
+                link.unlink()  # delete the egg-link file
 
-    def get_deps_list(self, pkg_name, installed_distros=None):
+    def get_deps_list(self, pkg_name: str, installed_distros: Optional[Iterable] = None):
         """
         For a given package, returns a list of required packages. Recursive.
         """
-        # https://github.com/Miserlou/Zappa/issues/1478.  Using `pkg_resources`
-        # instead of `pip` is the recommended approach.  The usage is nearly
-        # identical.
-        import pkg_resources
+        import importlib
+        from importlib.metadata import PathDistribution
 
         deps = []
-        if not installed_distros:
-            installed_distros = pkg_resources.WorkingSet()
-        for package in installed_distros:
-            if package.project_name.lower() == pkg_name.lower():
-                deps = [(package.project_name, package.version)]
-                for req in package.requires():
-                    deps += self.get_deps_list(pkg_name=req.project_name, installed_distros=installed_distros)
+        if installed_distros is None:
+            installed_distros: Iterable[PathDistribution] = importlib.metadata.distributions()  # type: ignore
+        for distribution_package in installed_distros:  # type: ignore
+            if distribution_package.name.lower() == pkg_name.lower():
+                deps = [(distribution_package.name, distribution_package.version)]
+                for (
+                    requirement_package_name
+                ) in distribution_package.requires:  # Generated requirements specified for this Distribution
+                    deps += self.get_deps_list(pkg_name=requirement_package_name, installed_distros=installed_distros)
         return list(set(deps))  # de-dupe before returning
 
     def create_handler_venv(self, use_zappa_release: Optional[str] = None):
@@ -434,28 +473,31 @@ class Zappa:
         import subprocess
 
         # We will need the currenv venv to pull Zappa from
-        current_venv = self.get_current_venv()
+        current_venv: Optional[Path] = self.get_current_venv()
 
         # Make a new folder for the handler packages
-        ve_path = os.path.join(os.getcwd(), "handler_venv")
+        ve_path: Path = Path.cwd() / "handler_venv"
 
-        if sys.platform == "win32":
-            current_site_packages_dir = os.path.join(current_venv, "Lib", "site-packages")
-            venv_site_packages_dir = os.path.join(ve_path, "Lib", "site-packages")
+        if current_venv and sys.platform == "win32":
+            current_site_packages_dir = current_venv / "Lib" / "site-packages"
+            venv_site_packages_dir = ve_path / "Lib" / "site-packages"
+        elif current_venv:
+            current_site_packages_dir = current_venv / "lib" / get_venv_from_python_version() / "site-packages"
+            venv_site_packages_dir = ve_path / "lib" / get_venv_from_python_version() / "site-packages"
         else:
-            current_site_packages_dir = os.path.join(current_venv, "lib", get_venv_from_python_version(), "site-packages")
-            venv_site_packages_dir = os.path.join(ve_path, "lib", get_venv_from_python_version(), "site-packages")
+            raise ValueError("Could not determine current virtualenv. Please activate it before running this command.")
 
-        if not os.path.isdir(venv_site_packages_dir):
-            os.makedirs(venv_site_packages_dir)
+        if not venv_site_packages_dir.exists():
+            venv_site_packages_dir.mkdir(parents=True, exist_ok=True)
 
         # Copy zappa* to the new virtualenv
-        zappa_things = [z for z in os.listdir(current_site_packages_dir) if z.lower()[:5] == "zappa"]
-        for z in zappa_things:
-            copytree(
-                os.path.join(current_site_packages_dir, z),
-                os.path.join(venv_site_packages_dir, z),
-            )
+        for zappa_thing in current_site_packages_dir.glob("[zZ]appa*"):
+            # copytree(
+            #     os.path.join(current_site_packages_dir, z),
+            #     os.path.join(venv_site_packages_dir, z),
+            # )
+            dest = venv_site_packages_dir / zappa_thing.name
+            copytree(str(zappa_thing.resolve()), str(dest.resolve()))
 
         # Use pip to download zappa's dependencies.
         # Copying from current venv causes issues with things like PyYAML that installs as yaml
@@ -476,7 +518,7 @@ class Zappa:
             "install",
             "--quiet",
             "--target",
-            venv_site_packages_dir,
+            str(venv_site_packages_dir),
         ] + pkg_list
 
         # This is the recommended method for installing packages if you don't
@@ -499,12 +541,12 @@ class Zappa:
 
     # staticmethod as per https://github.com/Miserlou/Zappa/issues/780
     @staticmethod
-    def get_current_venv():
+    def get_current_venv() -> Optional[Path]:
         """
         Returns the path to the current virtualenv
         """
         if "VIRTUAL_ENV" in os.environ:
-            venv = os.environ["VIRTUAL_ENV"]
+            venv: Path = Path(os.environ["VIRTUAL_ENV"])
             return venv
 
         # pyenv available check
@@ -518,9 +560,9 @@ class Zappa:
             # Each Python version is installed into its own directory under $(pyenv root)/versions
             # https://github.com/pyenv/pyenv#locating-pyenv-provided-python-installations
             # Related: https://github.com/zappa/Zappa/issues/1132
-            pyenv_root = subprocess.check_output(["pyenv", "root"]).decode("utf-8").strip()
-            pyenv_version = subprocess.check_output(["pyenv", "version-name"]).decode("utf-8").strip()
-            venv = os.path.join(pyenv_root, "versions", pyenv_version)
+            pyenv_root: Path = Path(subprocess.check_output(["pyenv", "root"]).decode("utf-8").strip())
+            pyenv_version: str = subprocess.check_output(["pyenv", "version-name"]).decode("utf-8").strip()
+            venv: Path = pyenv_root / "versions" / pyenv_version  # type: ignore
             return venv
 
         return None
@@ -648,19 +690,19 @@ class Zappa:
         package_id_file.close()
 
         # Then, do site site-packages..
-        egg_links = []
-        temp_package_path = tempfile.mkdtemp(prefix="zappa-packages")
+        egg_links: list[Path] = []
+        temp_package_path = Path(tempfile.mkdtemp(prefix="zappa-packages"))
         if sys.platform == "win32":
-            site_packages = os.path.join(venv, "Lib", "site-packages")
+            site_packages = venv / "Lib" / "site-packages"
         else:
-            site_packages = os.path.join(venv, "lib", get_venv_from_python_version(), "site-packages")
-        egg_links.extend(glob.glob(os.path.join(site_packages, "*.egg-link")))
+            site_packages = venv / "lib" / get_venv_from_python_version() / "site-packages"
+        egg_links.extend(list(site_packages.glob("*.egg-link")))
 
         if minify:
             excludes = ZIP_EXCLUDES + exclude
             copytree(
-                site_packages,
-                temp_package_path,
+                str(site_packages.resolve()),
+                str(temp_package_path.resolve()),
                 metadata=False,
                 symlinks=False,
                 ignore=shutil.ignore_patterns(*excludes),
@@ -669,20 +711,20 @@ class Zappa:
             copytree(site_packages, temp_package_path, metadata=False, symlinks=False)
 
         # We may have 64-bin specific packages too.
-        site_packages_64 = os.path.join(venv, "lib64", get_venv_from_python_version(), "site-packages")
-        if os.path.exists(site_packages_64):
-            egg_links.extend(glob.glob(os.path.join(site_packages_64, "*.egg-link")))
+        site_packages_64 = venv / "lib" / get_venv_from_python_version() / "site-packages" / "64"
+        if site_packages_64.exists():
+            egg_links.extend(list(site_packages_64.glob("*.egg-link")))
             if minify:
                 excludes = ZIP_EXCLUDES + exclude
                 copytree(
-                    site_packages_64,
-                    temp_package_path,
+                    str(site_packages_64.resolve()),
+                    str(temp_package_path.resolve()),
                     metadata=False,
                     symlinks=False,
                     ignore=shutil.ignore_patterns(*excludes),
                 )
             else:
-                copytree(site_packages_64, temp_package_path, metadata=False, symlinks=False)
+                copytree(str(site_packages_64.resolve()), str(temp_package_path.resolve()), metadata=False, symlinks=False)
 
         if egg_links:
             self.copy_editable_packages(egg_links, temp_package_path)
@@ -754,7 +796,7 @@ class Zappa:
                 # use the compiled bytecode anyway..
                 if filename[-3:] == ".py" and root[-10:] != "migrations":
                     abs_filename = os.path.join(root, filename)
-                    abs_pyc_filename = abs_filename + "c"
+                    abs_pyc_filename = f"{abs_filename}c"  # XXX.pyc
                     if os.path.isfile(abs_pyc_filename):
                         # but only if the pyc is older than the py,
                         # otherwise we'll deploy outdated code!
@@ -821,27 +863,32 @@ class Zappa:
         return archive_fname
 
     @staticmethod
-    def get_installed_packages(site_packages, site_packages_64):
+    def get_installed_packages(
+        site_packages: Optional[Path] = None, site_packages_64: Optional[Path] = None
+    ) -> dict[str, str]:
         """
         Returns a dict of installed packages that Zappa cares about.
         """
-        import pkg_resources
+        import importlib
 
-        package_to_keep = []
-        if os.path.isdir(site_packages):
-            package_to_keep += os.listdir(site_packages)
-        if os.path.isdir(site_packages_64):
-            package_to_keep += os.listdir(site_packages_64)
+        # collect pre-existing packages
+        packages_to_keep: list[str] = []
+        if site_packages and site_packages.is_dir():
+            packages_to_keep.extend([p.name.lower() for p in site_packages.glob("*")])
+        if site_packages_64 and site_packages_64.is_dir():
+            packages_to_keep.extend([p.name.lower() for p in site_packages_64.glob("*")])
 
-        package_to_keep = [x.lower() for x in package_to_keep]
+        additional_install_locations = []
+        if site_packages:
+            additional_install_locations.append(site_packages)
+        if site_packages_64:
+            additional_install_locations.append(site_packages_64)
 
-        installed_packages = {
-            package.project_name.lower(): package.version
-            for package in pkg_resources.WorkingSet()
-            if package.project_name.lower() in package_to_keep
-            or package.location.lower() in [site_packages.lower(), site_packages_64.lower()]
-        }
-
+        installed_packages = {}  # {PACKAGE_NAME: VERSION}
+        for package in importlib.metadata.distributions():  # returns PathDistribution objects
+            package_installed_directory: Path = package.locate_file(path="")  # type: ignore
+            if package.name.lower() in packages_to_keep or package_installed_directory in additional_install_locations:
+                installed_packages[package.name.lower()] = package.version
         return installed_packages
 
     @staticmethod
@@ -870,34 +917,33 @@ class Zappa:
         """
         Gets the locally stored version of a manylinux wheel. If one does not exist, the function downloads it.
         """
-        cached_wheels_dir = os.path.join(tempfile.gettempdir(), "cached_wheels")
+        cached_wheels_dir = Path(tempfile.gettempdir()) / "cached_wheels"
 
-        if not os.path.isdir(cached_wheels_dir):
-            os.makedirs(cached_wheels_dir)
+        if not cached_wheels_dir.is_dir() or not cached_wheels_dir.exists():
+            cached_wheels_dir.mkdir(parents=True, exist_ok=True)
         else:
             # Check if we already have a cached copy
+            # - get package name from prefix of the wheel file
             wheel_name = re.sub(r"[^\w\d.]+", "_", package_name, flags=re.UNICODE)
-            wheel_file = f"{wheel_name}-{package_version}-*_x86_64.whl"
-            wheel_path = os.path.join(cached_wheels_dir, wheel_file)
-
-            for pathname in glob.iglob(wheel_path):
-                if re.match(self.manylinux_wheel_file_match, pathname):
-                    logger.info(f" - {package_name}=={package_version}: Using locally cached manylinux wheel")
-                    return pathname
-                elif re.match(self.manylinux_wheel_abi3_file_match, pathname):
-                    for manylinux_suffix in self.manylinux_suffixes:
-                        if f"manylinux{manylinux_suffix}_x86_64" in pathname:
-                            logger.info(f" - {package_name}=={package_version}: Using locally cached manylinux wheel")
-                            return pathname
+            valid_architectures = (X86_ARCHITECTURE,)
+            if self.architecture == ARM_ARCHITECTURE:
+                valid_architectures = (ARM_ARCHITECTURE, "aarch64")
+            for arch in valid_architectures:
+                wheel_file_pattern = f"{wheel_name}-{package_version}-*_{arch}.whl"
+                for pathname in cached_wheels_dir.glob(wheel_file_pattern):
+                    if self.manylinux_wheel_file_match.match(str(pathname)):
+                        logger.info(f" - {package_name}=={package_version}: Using locally cached manylinux wheel")
+                        return pathname
 
         # The file is not cached, download it.
         wheel_url, filename = self.get_manylinux_wheel_url(package_name, package_version)
         if not wheel_url:
+            logger.warning(f" - {package_name}=={package_version}: No manylinux wheel found for this package")
             return None
 
-        wheel_path = os.path.join(cached_wheels_dir, filename)
+        wheel_path = cached_wheels_dir / filename
         logger.info(f" - {package_name}=={package_version}: Downloading")
-        with open(wheel_path, "wb") as f:
+        with wheel_path.open("wb") as f:
             self.download_url_with_progress(wheel_url, f, disable_progress)
 
         if not zipfile.is_zipfile(wheel_path):
@@ -917,8 +963,8 @@ class Zappa:
         every time.
         """
         cached_pypi_info_dir = Path(tempfile.gettempdir()) / "cached_pypi_info"
-        if not cached_pypi_info_dir.is_dir():
-            os.makedirs(cached_pypi_info_dir)
+        if not cached_pypi_info_dir.exists():
+            cached_pypi_info_dir.mkdir(parents=True, exist_ok=True)
 
         # Even though the metadata is for the package, we save it in a
         # filename that includes the package's version. This helps in
@@ -926,14 +972,14 @@ class Zappa:
         # version of the package.
         # Related: https://github.com/Miserlou/Zappa/issues/899
         data = None
-        json_file_name = "{0!s}-{1!s}.json".format(package_name, package_version)
+        json_file_name = f"{package_name!s}-{package_version!s}.json"
         json_file_path = cached_pypi_info_dir / json_file_name
         if json_file_path.exists():
             with json_file_path.open("rb") as metafile:
                 data = json.load(metafile)
 
         if not data or ignore_cache:
-            url = "https://pypi.python.org/pypi/{}/json".format(package_name)
+            url = f"https://pypi.python.org/pypi/{package_name}/json"
             try:
                 res = requests.get(url, timeout=float(os.environ.get("PIP_TIMEOUT", 1.5)))
                 data = res.json()
@@ -949,14 +995,10 @@ class Zappa:
             return None, None
 
         for f in data["releases"][package_version]:
-            if re.match(self.manylinux_wheel_file_match, f["filename"]):
+            if self.manylinux_wheel_file_match.match(f["filename"]):
                 # Since we have already lowered package names in get_installed_packages
                 # manylinux caching is not working for packages with capital case in names like MarkupSafe
                 return f["url"], f["filename"].lower()
-            elif re.match(self.manylinux_wheel_abi3_file_match, f["filename"]):
-                for manylinux_suffix in self.manylinux_suffixes:
-                    if f"manylinux{manylinux_suffix}_x86_64" in f["filename"]:
-                        return f["url"], f["filename"].lower()
         return None, None
 
     ##
@@ -1126,6 +1168,8 @@ class Zappa:
             TracingConfig={"Mode": "Active" if self.xray_tracing else "PassThrough"},
             SnapStart={"ApplyOn": snap_start if snap_start else "None"},
             Layers=layers,
+            # zappa currently only supports a single architecture, and uses a str value internally
+            Architectures=[self.architecture],
         )
         if not docker_image_uri:
             kwargs["Runtime"] = runtime
@@ -1443,6 +1487,214 @@ class Zappa:
         return self.lambda_client.delete_function(
             FunctionName=function_name,
         )
+
+    ##
+    # Function URL
+    ##
+    def list_function_url_policy(self, function_name):
+        results = []
+        try:
+            policy_response = self.lambda_client.get_policy(FunctionName=function_name)
+            if policy_response["ResponseMetadata"]["HTTPStatusCode"] == 200:
+                statement = json.loads(policy_response["Policy"])["Statement"]
+                for s in statement:
+                    if s["Sid"] in ["FunctionURLAllowPublicAccess"]:
+                        results.append(s)
+            else:
+                logger.debug("Failed to load Lambda function policy: {}".format(policy_response))
+        except ClientError as e:
+            if e.args[0].find("ResourceNotFoundException") > -1:
+                logger.debug("No policy found, must be first run.")
+            else:
+                logger.error("Unexpected client error {}".format(e.args[0]))
+        return results
+
+    def delete_function_url_policy(self, function_name):
+        statements = self.list_function_url_policy(function_name)
+        for s in statements:
+            delete_response = self.lambda_client.remove_permission(FunctionName=function_name, StatementId=s["Sid"])
+            if delete_response["ResponseMetadata"]["HTTPStatusCode"] != 204:
+                logger.error("Failed to delete an obsolete policy statement: {}".format(delete_response))
+
+    def update_function_url_policy(self, function_name, function_url_config):
+        statements = self.list_function_url_policy(function_name)
+
+        if function_url_config["authorizer"] == "NONE":
+            if not statements:
+                self.lambda_client.add_permission(
+                    FunctionName=function_name,
+                    StatementId="FunctionURLAllowPublicAccess",
+                    Action="lambda:InvokeFunctionUrl",
+                    Principal="*",
+                    FunctionUrlAuthType=function_url_config["authorizer"],
+                )
+        elif function_url_config["authorizer"] == "AWS_IAM":
+            if statements:
+                self.delete_function_url_policy(function_name)
+
+    def deploy_lambda_function_url(self, function_name, function_url_config):
+        if function_url_config["cors"]:
+            response = self.lambda_client.create_function_url_config(
+                FunctionName=function_name,
+                AuthType=function_url_config["authorizer"],
+                Cors={
+                    "AllowCredentials": function_url_config["cors"]["allowCredentials"],
+                    "AllowHeaders": function_url_config["cors"]["allowedHeaders"],
+                    "AllowMethods": function_url_config["cors"]["allowedMethods"],
+                    "AllowOrigins": function_url_config["cors"]["allowedOrigins"],
+                    "ExposeHeaders": function_url_config["cors"]["exposedResponseHeaders"],
+                    "MaxAge": function_url_config["cors"]["maxAge"],
+                },
+            )
+        else:
+            response = self.lambda_client.create_function_url_config(
+                FunctionName=function_name, AuthType=function_url_config["authorizer"]
+            )
+        print("function URL address: {}".format(response["FunctionUrl"]))
+        self.update_function_url_policy(function_name, function_url_config)
+        return response
+
+    def update_lambda_function_url(self, function_name, function_url_config):
+        response = self.lambda_client.list_function_url_configs(FunctionName=function_name, MaxItems=50)
+        if response.get("FunctionUrlConfigs", []):
+            for config in response["FunctionUrlConfigs"]:
+                if function_url_config["cors"]:
+                    response = self.lambda_client.update_function_url_config(
+                        FunctionName=config["FunctionArn"],
+                        AuthType=function_url_config["authorizer"],
+                        Cors={
+                            "AllowCredentials": function_url_config["cors"]["allowCredentials"],
+                            "AllowHeaders": function_url_config["cors"]["allowedHeaders"],
+                            "AllowMethods": function_url_config["cors"]["allowedMethods"],
+                            "AllowOrigins": function_url_config["cors"]["allowedOrigins"],
+                            "ExposeHeaders": function_url_config["cors"]["exposedResponseHeaders"],
+                            "MaxAge": function_url_config["cors"]["maxAge"],
+                        },
+                    )
+                else:
+                    response = self.lambda_client.update_function_url_config(
+                        FunctionName=function_name, AuthType=function_url_config["authorizer"]
+                    )
+                print("function URL address: {}".format(response["FunctionUrl"]))
+                self.update_function_url_policy(config["FunctionArn"], function_url_config)
+        else:
+            self.deploy_lambda_function_url(function_name, function_url_config)
+
+    def delete_lambda_function_url(self, function_name):
+        response = self.lambda_client.list_function_url_configs(FunctionName=function_name, MaxItems=50)
+        for config in response.get("FunctionUrlConfigs", []):
+            resp = self.lambda_client.delete_function_url_config(FunctionName=config["FunctionArn"])
+            if resp["ResponseMetadata"]["HTTPStatusCode"] == 204:
+                print("function URL deleted: {}".format(config["FunctionUrl"]))
+            self.delete_function_url_policy(config["FunctionArn"])
+
+    ##
+    # Cloudfront distribution
+    ##
+    def update_lambda_function_url_domains(self, function_name, function_url_domains, certificate_arn, cloudfront_config):
+        response = self.lambda_client.list_function_url_configs(FunctionName=function_name, MaxItems=50)
+        if not response.get("FunctionUrlConfigs", []):
+            print("no function url configured on lambda, skip setting custom domains")
+        url = response["FunctionUrlConfigs"][0]["FunctionUrl"]
+        import urllib
+
+        url = urllib.parse.urlparse(url)
+
+        NULL_CONFIG = {"Quantity": 0, "Items": []}
+
+        config = {
+            "CallerReference": "zappa-create-function-url-custom-domain-" + function_name.split(":")[-1],
+            "Aliases": {"Quantity": len(function_url_domains), "Items": function_url_domains},
+            "DefaultRootObject": "",
+            "Enabled": True,
+            "PriceClass": "PriceClass_100",
+            "HttpVersion": "http2",
+            "Comment": "Lambda FunctionURL {}".format(function_name.split(":")[-1]),
+            "Origins": {
+                "Quantity": 1,
+                "Items": [
+                    {
+                        "Id": "LambdaFunctionURL",
+                        "DomainName": url.hostname,
+                        "OriginPath": "",
+                        "CustomHeaders": {
+                            "Quantity": 1,
+                            "Items": [
+                                {"HeaderName": "CloudFront", "HeaderValue": "CloudFront"},
+                            ],
+                        },
+                        "CustomOriginConfig": {
+                            "HTTPPort": 80,
+                            "HTTPSPort": 443,
+                            "OriginProtocolPolicy": "https-only",
+                            "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1"]},
+                            "OriginReadTimeout": 60,
+                            "OriginKeepaliveTimeout": 60,
+                        },
+                    }
+                ],
+            },
+            "CacheBehaviors": NULL_CONFIG,
+            "CustomErrorResponses": NULL_CONFIG,
+            "DefaultCacheBehavior": {
+                "TargetOriginId": "LambdaFunctionURL",
+                "ViewerProtocolPolicy": "redirect-to-https",
+                "Compress": True,
+                "SmoothStreaming": True,
+                "LambdaFunctionAssociations": NULL_CONFIG,
+                "FieldLevelEncryptionId": "",
+                "AllowedMethods": {
+                    "Quantity": 7,
+                    "Items": ["HEAD", "DELETE", "POST", "GET", "OPTIONS", "PUT", "PATCH"],
+                    "CachedMethods": {"Quantity": 3, "Items": ["HEAD", "GET", "OPTIONS"]},
+                },
+                "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",  # noqa: E501 https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
+                "OriginRequestPolicyId": "b689b0a8-53d0-40ab-baf2-68738e2966ac",  # noqa: E501 https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html#managed-origin-request-policy-all-viewer-except-host-header
+            },
+            "Logging": {"Enabled": False, "IncludeCookies": False, "Bucket": "", "Prefix": ""},
+            "Restrictions": {"GeoRestriction": {"RestrictionType": "none", **NULL_CONFIG}},
+            "WebACLId": "",
+        }
+        if certificate_arn:
+            config["ViewerCertificate"] = {
+                "ACMCertificateArn": certificate_arn,
+                "SSLSupportMethod": "sni-only",
+                "MinimumProtocolVersion": "TLSv1.2_2021",
+            }
+
+        config.update(cloudfront_config)
+        distributions = self.cloudfront_client.list_distributions()
+        distributions = [
+            item
+            for item in distributions["DistributionList"]["Items"]
+            if url.hostname in [origin["DomainName"] for origin in item["Origins"]["Items"]]
+        ]
+
+        if not distributions:
+            response = self.cloudfront_client.create_distribution(DistributionConfig=config)
+            if response["ResponseMetadata"]["HTTPStatusCode"] == 201:
+                print(
+                    "created cloudfront distribution for {}. It will take a while for the change to be deployed.".format(
+                        function_url_domains
+                    )
+                )
+                return response["Distribution"]["DomainName"]
+        else:
+            id = distributions[0]["Id"]
+            distribution = self.cloudfront_client.get_distribution(Id=id)
+            new_config = distribution["Distribution"]["DistributionConfig"]
+            new_config.update(config)
+
+            response = self.cloudfront_client.update_distribution(
+                DistributionConfig=new_config, Id=id, IfMatch=distribution["ETag"]
+            )
+            if response["ResponseMetadata"]["HTTPStatusCode"] == 200:
+                print(
+                    "update cloudfront distribution for {}. It will take a while for the change to be deployed.".format(
+                        function_url_domains
+                    )
+                )
+                return response["Distribution"]["DomainName"]
 
     ##
     # Application load balancer
@@ -2710,6 +2962,8 @@ class Zappa:
             if policy_response["ResponseMetadata"]["HTTPStatusCode"] == 200:
                 statement = json.loads(policy_response["Policy"])["Statement"]
                 for s in statement:
+                    if s["Sid"] in ["FunctionURLAllowPublicAccess"]:
+                        continue
                     delete_response = self.lambda_client.remove_permission(FunctionName=lambda_name, StatementId=s["Sid"])
                     if delete_response["ResponseMetadata"]["HTTPStatusCode"] != 204:
                         logger.error("Failed to delete an obsolete policy statement: {}".format(policy_response))
