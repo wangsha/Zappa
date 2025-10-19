@@ -225,6 +225,8 @@ def get_runtime_from_python_version() -> str:
             return "python3.12"
         elif sys.version_info[1] == 13:
             return "python3.13"
+        elif sys.version_info[1] == 14:
+            return "python3.14"
         else:
             raise ValueError(f"Python f{'.'.join(str(v) for v in sys.version_info[:2])} is not yet supported.")
 
@@ -552,7 +554,10 @@ class SNSEventSource(BaseEventSource):
         # Only remove Lambda permission if we actually had a subscription
         if subscription_removed:
             try:
-                self._lambda.remove_permission(FunctionName=function_arn, StatementId=f"sns-{self.arn.split(':')[-1]}")
+                self._lambda.remove_permission(
+                    FunctionName=function_arn,
+                    StatementId=f"sns-{self.arn.split(':')[-1]}",
+                )
             except Exception as e:
                 LOG.warning(f"Failed to remove Lambda permission for SNS event source {self.arn}: {e.args}")
 
@@ -678,7 +683,11 @@ class CloudWatchEventSource(BaseEventSource):
 
 
 def get_event_source(
-    event_source: Dict[str, Any], lambda_arn: str, target_function: str, boto_session: boto3.Session, dry: bool = False
+    event_source: Dict[str, Any],
+    lambda_arn: str,
+    target_function: str,
+    boto_session: boto3.Session,
+    dry: bool = False,
 ) -> Tuple[BaseEventSource, str]:
     """
     Given an event_source dictionary item, a session and a lambda_arn,
@@ -716,7 +725,11 @@ def get_event_source(
 
 
 def add_event_source(
-    event_source: Dict[str, Any], lambda_arn: str, target_function: str, boto_session: boto3.Session, dry: bool = False
+    event_source: Dict[str, Any],
+    lambda_arn: str,
+    target_function: str,
+    boto_session: boto3.Session,
+    dry: bool = False,
 ) -> str:
     """
     Given an event_source dictionary, create the object and add the event source.
@@ -734,7 +747,11 @@ def add_event_source(
 
 
 def remove_event_source(
-    event_source: Dict[str, Any], lambda_arn: str, target_function: str, boto_session: boto3.Session, dry: bool = False
+    event_source: Dict[str, Any],
+    lambda_arn: str,
+    target_function: str,
+    boto_session: boto3.Session,
+    dry: bool = False,
 ) -> Union[BaseEventSource, bool, Dict[str, Any], None]:
     """
     Given an event_source dictionary, create the object and remove the event source.
@@ -749,7 +766,11 @@ def remove_event_source(
 
 
 def get_event_source_status(
-    event_source: Dict[str, Any], lambda_arn: str, target_function: str, boto_session: boto3.Session, dry: bool = False
+    event_source: Dict[str, Any],
+    lambda_arn: str,
+    target_function: str,
+    boto_session: boto3.Session,
+    dry: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Given an event_source dictionary, create the object and get the event source status.

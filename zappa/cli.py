@@ -28,6 +28,7 @@ import argcomplete
 import botocore
 import click
 import hjson as json
+
 # import pkg_resources
 import requests
 import slugify
@@ -1940,7 +1941,13 @@ class ZappaCLI:
                 "s3_bucket": bucket,
                 "runtime": get_venv_from_python_version(),
                 "project_name": self.get_project_name(),
-                "exclude": ["boto3", "dateutil", "botocore", "s3transfer", "concurrent"],
+                "exclude": [
+                    "boto3",
+                    "dateutil",
+                    "botocore",
+                    "s3transfer",
+                    "concurrent",
+                ],
             }
         }
 
@@ -2165,7 +2172,10 @@ class ZappaCLI:
         if self.use_function_url:
             self.lambda_arn = self.zappa.get_lambda_function(function_name=self.lambda_name)
             dns_name = self.zappa.update_lambda_function_url_domains(
-                self.lambda_arn, self.function_url_domains, cert_arn, self.function_url_cloudfront_config
+                self.lambda_arn,
+                self.function_url_domains,
+                cert_arn,
+                self.function_url_cloudfront_config,
             )
             if route53:
                 for domain in self.function_url_domains:
@@ -3093,6 +3103,7 @@ class ZappaCLI:
 
         if req.status_code == 200:
             click.echo(req.text)
+
 
 ####################################################################
 # Main

@@ -1,8 +1,8 @@
 """
 Zappa core library. You may also want to look at `cli.py` and `util.py`.
 """
-import datetime
 
+import datetime
 import getpass
 import hashlib
 import json
@@ -249,7 +249,7 @@ def build_manylinux_wheel_file_match_pattern(runtime: str, architecture: str) ->
     # Support PEP600 (https://peps.python.org/pep-0600/)
     # The wheel filename is {distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl
     runtime_major_version, runtime_minor_version = runtime[6:].split(".")
-    python_tag = f"cp{runtime_major_version}{runtime_minor_version}"  # python3.13 -> cp313
+    python_tag = f"cp{runtime_major_version}{runtime_minor_version}"  # python3.14 -> cp314
     manylinux_legacy_tags = ("manylinux2014", "manylinux2010", "manylinux1")
     if architecture == X86_ARCHITECTURE:
         valid_platform_tags = [X86_ARCHITECTURE]
@@ -314,7 +314,7 @@ class Zappa:
         load_credentials=True,
         desired_role_name=None,
         desired_role_arn=None,
-        runtime="python3.13",  # Detected at runtime in CLI
+        runtime="python3.14",  # Detected at runtime in CLI
         tags=(),
         endpoint_urls={},
         xray_tracing=False,
@@ -468,7 +468,10 @@ class Zappa:
                 for (
                     requirement_package_name
                 ) in distribution_package.requires:  # Generated requirements specified for this Distribution
-                    deps += self.get_deps_list(pkg_name=requirement_package_name, installed_distros=installed_distros)
+                    deps += self.get_deps_list(
+                        pkg_name=requirement_package_name,
+                        installed_distros=installed_distros,
+                    )
         return list(set(deps))  # de-dupe before returning
 
     def create_handler_venv(self, use_zappa_release: Optional[str] = None):
@@ -730,7 +733,12 @@ class Zappa:
                     ignore=shutil.ignore_patterns(*excludes),
                 )
             else:
-                copytree(site_packages_64.resolve(), temp_package_path.resolve(), metadata=False, symlinks=False)
+                copytree(
+                    site_packages_64.resolve(),
+                    temp_package_path.resolve(),
+                    metadata=False,
+                    symlinks=False,
+                )
 
         if egg_links:
             self.copy_editable_packages(egg_links, temp_package_path)
@@ -1135,7 +1143,7 @@ class Zappa:
         publish=True,
         vpc_config=None,
         dead_letter_config=None,
-        runtime="python3.13",
+        runtime="python3.14",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         snap_start=None,
@@ -1328,7 +1336,7 @@ class Zappa:
         ephemeral_storage={"Size": 512},
         publish=True,
         vpc_config=None,
-        runtime="python3.13",
+        runtime="python3.14",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         layers=None,
@@ -1589,7 +1597,8 @@ class Zappa:
                     )
                 else:
                     response = self.lambda_client.update_function_url_config(
-                        FunctionName=function_name, AuthType=function_url_config["authorizer"]
+                        FunctionName=function_name,
+                        AuthType=function_url_config["authorizer"],
                     )
                 print("function URL address: {}".format(response["FunctionUrl"]))
                 self.update_function_url_policy(config["FunctionArn"], function_url_config)
@@ -1620,7 +1629,10 @@ class Zappa:
 
         config = {
             "CallerReference": "zappa-create-function-url-custom-domain-" + function_name.split(":")[-1],
-            "Aliases": {"Quantity": len(function_url_domains), "Items": function_url_domains},
+            "Aliases": {
+                "Quantity": len(function_url_domains),
+                "Items": function_url_domains,
+            },
             "DefaultRootObject": "",
             "Enabled": True,
             "PriceClass": "PriceClass_100",
@@ -1636,7 +1648,10 @@ class Zappa:
                         "CustomHeaders": {
                             "Quantity": 1,
                             "Items": [
-                                {"HeaderName": "CloudFront", "HeaderValue": "CloudFront"},
+                                {
+                                    "HeaderName": "CloudFront",
+                                    "HeaderValue": "CloudFront",
+                                },
                             ],
                         },
                         "CustomOriginConfig": {
@@ -1661,13 +1676,29 @@ class Zappa:
                 "FieldLevelEncryptionId": "",
                 "AllowedMethods": {
                     "Quantity": 7,
-                    "Items": ["HEAD", "DELETE", "POST", "GET", "OPTIONS", "PUT", "PATCH"],
-                    "CachedMethods": {"Quantity": 3, "Items": ["HEAD", "GET", "OPTIONS"]},
+                    "Items": [
+                        "HEAD",
+                        "DELETE",
+                        "POST",
+                        "GET",
+                        "OPTIONS",
+                        "PUT",
+                        "PATCH",
+                    ],
+                    "CachedMethods": {
+                        "Quantity": 3,
+                        "Items": ["HEAD", "GET", "OPTIONS"],
+                    },
                 },
                 "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",  # noqa: E501 https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
                 "OriginRequestPolicyId": "b689b0a8-53d0-40ab-baf2-68738e2966ac",  # noqa: E501 https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html#managed-origin-request-policy-all-viewer-except-host-header
             },
-            "Logging": {"Enabled": False, "IncludeCookies": False, "Bucket": "", "Prefix": ""},
+            "Logging": {
+                "Enabled": False,
+                "IncludeCookies": False,
+                "Bucket": "",
+                "Prefix": "",
+            },
             "Restrictions": {"GeoRestriction": {"RestrictionType": "none", **NULL_CONFIG}},
             "WebACLId": "",
         }
@@ -2893,7 +2924,11 @@ class Zappa:
                         "path": "/certificateName",
                         "value": certificate_name,
                     },
-                    {"op": "replace", "path": "/certificateArn", "value": certificate_arn},
+                    {
+                        "op": "replace",
+                        "path": "/certificateArn",
+                        "value": certificate_arn,
+                    },
                 ],
             )
         if use_function_url:
@@ -3058,15 +3093,9 @@ class Zappa:
                 for s in statement:
                     if s["Sid"].startswith("zappa-"):
                         logger.debug(f"delete policy {s['Sid']}-{s['Principal']}")
-                        delete_response = self.lambda_client.remove_permission(
-                            FunctionName=lambda_name, StatementId=s["Sid"]
-                        )
+                        delete_response = self.lambda_client.remove_permission(FunctionName=lambda_name, StatementId=s["Sid"])
                         if delete_response["ResponseMetadata"]["HTTPStatusCode"] != 204:
-                            logger.error(
-                                "Failed to delete an obsolete policy statement: {}".format(
-                                    policy_response
-                                )
-                            )
+                            logger.error("Failed to delete an obsolete policy statement: {}".format(policy_response))
             else:
                 logger.debug("Failed to load Lambda function policy: {}".format(policy_response))
         except ClientError as e:
@@ -3090,10 +3119,7 @@ class Zappa:
 
         permission_response = self.lambda_client.add_permission(
             FunctionName=lambda_name,
-            StatementId="zappa-"
-            + "".join(
-                random.choice(string.ascii_uppercase + string.digits) for _ in range(8)
-            ),
+            StatementId="zappa-" + "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8)),
             Action="lambda:InvokeFunction",
             Principal=principal,
             SourceArn=source_arn,

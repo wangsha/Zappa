@@ -6,9 +6,7 @@ _responses_ when Binary Support is enabled.
 import gzip
 import json
 
-
 from flask import Flask, Response
-
 
 app = Flask(__name__)
 
