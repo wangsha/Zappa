@@ -224,6 +224,14 @@ class TestZappa(unittest.TestCase):
             self.assertTrue(os.path.isfile(path))
             os.remove(path)
 
+    def test_manylinux_pattern_python314(self):
+        z = Zappa(runtime="python3.14")
+        wheel_filename = "psycopg_binary-3.2.5-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+        abi3_wheel_filename = "cryptography-44.0.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+
+        self.assertTrue(z.manylinux_wheel_file_match.match(wheel_filename))
+        self.assertTrue(z.manylinux_wheel_file_match.match(abi3_wheel_filename))
+
         # same, but with an ABI3 package
         mock_installed_packages = {"cryptography": "44.0.2"}
         with mock.patch(
@@ -276,7 +284,8 @@ class TestZappa(unittest.TestCase):
 
             self.assertEqual(file_name, expected_filename)
             mock_get.assert_called_once_with(
-                "https://pypi.python.org/pypi/markupsafe/json", timeout=float(os.environ.get("PIP_TIMEOUT", 1.5))
+                "https://pypi.python.org/pypi/markupsafe/json",
+                timeout=float(os.environ.get("PIP_TIMEOUT", 1.5)),
             )
 
         # Clean the generated files
@@ -298,7 +307,10 @@ class TestZappa(unittest.TestCase):
                 return_value=mock_installed_packages,
             ):
                 z = Zappa(runtime="python3.11")
-                path = z.create_lambda_zip(handler_file=os.path.realpath(__file__), exclude_glob=[str(file_to_not_delete)])
+                path = z.create_lambda_zip(
+                    handler_file=os.path.realpath(__file__),
+                    exclude_glob=[str(file_to_not_delete)],
+                )
                 self.assertTrue(os.path.isfile(path))
                 self.assertTrue(file_to_not_delete.exists())
                 os.remove(file_to_not_delete)
@@ -318,7 +330,10 @@ class TestZappa(unittest.TestCase):
 
         mock_pip_installed_packages = [sample_package]
         with mock.patch("importlib.metadata.distributions", return_value=mock_pip_installed_packages):
-            self.assertDictEqual(z.get_installed_packages(site_packages=site_packages), {"super_package": "0.1"})
+            self.assertDictEqual(
+                z.get_installed_packages(site_packages=site_packages),
+                {"super_package": "0.1"},
+            )
 
     def test_get_current_venv(self, *args):
         z = Zappa()
@@ -344,7 +359,11 @@ class TestZappa(unittest.TestCase):
         z = Zappa(runtime="python3.8")
 
         mock_pip_installed_packages = []
-        for package_name, version, location in ("SuperPackage", "0.1", "/Venv/site-packages"), (
+        for package_name, version, location in (
+            "SuperPackage",
+            "0.1",
+            "/Venv/site-packages",
+        ), (
             "SuperPackage64",
             "0.1",
             "/Venv/site-packages64",
@@ -388,7 +407,10 @@ class TestZappa(unittest.TestCase):
 
         mock_pip_installed_packages = [sample_package]
         with mock.patch("importlib.metadata.distributions", return_value=mock_pip_installed_packages):
-            self.assertDictEqual(z.get_installed_packages(site_packages=site_packages), {"superpackage": "0.1"})
+            self.assertDictEqual(
+                z.get_installed_packages(site_packages=site_packages),
+                {"superpackage": "0.1"},
+            )
 
     def test_load_credentials(self):
         z = Zappa()
@@ -1252,7 +1274,14 @@ class TestZappa(unittest.TestCase):
 
     def test_wsgi_from_v2_event_with_lambda_authorizer(self):
         principal_id = "user|a1b2c3d4"
-        authorizer = {"lambda": {"bool": True, "key": "value", "number": 1, "principalId": principal_id}}
+        authorizer = {
+            "lambda": {
+                "bool": True,
+                "key": "value",
+                "number": 1,
+                "principalId": principal_id,
+            }
+        }
         event = {
             "version": "2.0",
             "routeKey": "ANY /{proxy+}",
@@ -1382,11 +1411,17 @@ class TestZappa(unittest.TestCase):
 
                 zappa_cli = ZappaCLI()
                 with mock.patch("zappa.cli.ZappaCLI._get_init_env", return_value="dev"), mock.patch(
-                    "zappa.cli.ZappaCLI._get_init_profile", return_value=("default", {"region": "us-west-2"})
-                ), mock.patch("zappa.cli.ZappaCLI._get_init_bucket", return_value="my-zappa-bucket"), mock.patch(
-                    "zappa.cli.ZappaCLI._get_init_django_settings", return_value="test_settings"
+                    "zappa.cli.ZappaCLI._get_init_profile",
+                    return_value=("default", {"region": "us-west-2"}),
                 ), mock.patch(
-                    "zappa.cli.ZappaCLI._get_init_global_settings", return_value=["n", False]
+                    "zappa.cli.ZappaCLI._get_init_bucket",
+                    return_value="my-zappa-bucket",
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_django_settings",
+                    return_value="test_settings",
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_global_settings",
+                    return_value=["n", False],
                 ), mock.patch(
                     "zappa.cli.ZappaCLI._get_init_confirm", return_value="y"
                 ):
@@ -1400,7 +1435,8 @@ class TestZappa(unittest.TestCase):
                     self.assertEqual(zappa_settings["dev"]["s3_bucket"], "my-zappa-bucket")
                     self.assertEqual(zappa_settings["dev"]["django_settings"], "test_settings")
                     self.assertEqual(
-                        zappa_settings["dev"]["exclude"], ["boto3", "dateutil", "botocore", "s3transfer", "concurrent"]
+                        zappa_settings["dev"]["exclude"],
+                        ["boto3", "dateutil", "botocore", "s3transfer", "concurrent"],
                     )
 
                 # delete the file
@@ -1534,7 +1570,10 @@ class TestZappa(unittest.TestCase):
         zappa_cli.api_stage = "addtextmimetypes"
         zappa_cli.load_settings("test_settings.json")
         expected_additional_text_mimetypes = ["application/custommimetype"]
-        self.assertEqual(expected_additional_text_mimetypes, zappa_cli.stage_config["additional_text_mimetypes"])
+        self.assertEqual(
+            expected_additional_text_mimetypes,
+            zappa_cli.stage_config["additional_text_mimetypes"],
+        )
         self.assertEqual(True, zappa_cli.stage_config["binary_support"])
 
     def test_settings_extension(self):
@@ -3051,6 +3090,17 @@ class TestZappa(unittest.TestCase):
 
             reload(zappa)
 
+    @mock.patch("sys.version_info", new_callable=partial(get_sys_versioninfo, 14))
+    def test_supported_python_version(self, *_):
+        from importlib import reload
+
+        try:
+            import zappa
+
+            reload(zappa)
+        except RuntimeError as exc:  # pragma: no cover
+            self.fail(f"RuntimeError raised for supported Python version: {exc}")
+
     @mock.patch("os.getenv", return_value="True")
     @mock.patch("sys.version_info", new_callable=partial(get_sys_versioninfo, 6))
     def test_minor_version_only_check_when_in_docker(self, *_):
@@ -3109,7 +3159,11 @@ class TestZappa(unittest.TestCase):
             "pathParameters": {},
             "path": "/path/path1",
             "httpMethod": "GET",
-            "queryStringParameters": {"query": "Jane&John", "otherquery": "B", "test": "hello+m.te&how&are&you"},
+            "queryStringParameters": {
+                "query": "Jane&John",
+                "otherquery": "B",
+                "test": "hello+m.te&how&are&you",
+            },
             "requestContext": {},
         }
         request = create_wsgi_request(event)
