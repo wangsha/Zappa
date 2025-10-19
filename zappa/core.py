@@ -1258,7 +1258,7 @@ class Zappa:
         """
         logger.info("Updating Lambda function code..")
 
-        kwargs = dict(FunctionName=function_name, Publish=publish, Architectures=architecture)
+        kwargs = dict(FunctionName=function_name, Publish=publish, Architectures=[architecture])
         if docker_image_uri:
             kwargs["ImageUri"] = docker_image_uri
         elif local_zip:
