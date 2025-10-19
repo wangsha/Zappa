@@ -151,5 +151,19 @@
         "extends": "function_url_enabled",
         "function_url_domains": ["test-lambda-function-url.example.com", "test-lambda-function-url-1.example.com"],
         "route53_enabled": true
-    }
+    },
+    "arch_arm64": {
+        "s3_bucket": "lmbda",
+        "app_function": "tests.test_app.hello_world",
+        "delete_local_zip": true,
+        "debug": true,
+        "architecture": "arm64"
+     },
+     "archfail": {
+        "s3_bucket": "lmbda",
+        "app_function": "tests.test_app.hello_world",
+        "delete_local_zip": true,
+        "debug": true,
+        "architecture": "invalid_architecture"
+     }
 }
