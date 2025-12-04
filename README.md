@@ -16,6 +16,15 @@
 - [About](#about)
 - [Installation and Configuration](#installation-and-configuration)
   - [Running the Initial Setup / Settings](#running-the-initial-setup--settings)
+  - [Alternative: Generating Settings via CLI](#alternative-generating-settings-via-cli)
+- [Using command-line arguments](#using-command-line-arguments)
+- [Using environment variables](#using-environment-variables)
+- [Command-line arguments override environment variables](#command-line-arguments-override-environment-variables)
+    - [Nested JSON Configurations](#nested-json-configurations)
+- [Configure CORS with nested JSON](#configure-cors-with-nested-json)
+- [Configure VPC settings](#configure-vpc-settings)
+- [Configure environment variables](#configure-environment-variables)
+- [Configure Lambda layers](#configure-lambda-layers)
 - [Basic Usage](#basic-usage)
   - [Initial Deployments](#initial-deployments)
   - [Updates](#updates)
@@ -188,6 +197,72 @@ or for Django:
 _Psst: If you're deploying a Django application with Zappa for the first time, you might want to read Edgar Roman's [Django Zappa Guide](https://edgarroman.github.io/zappa-django-guide/)._
 
 You can define as many stages as your like - we recommend having _dev_, _staging_, and _production_.
+
+### Alternative: Generating Settings via CLI
+
+Instead of using the interactive `init` command, you can also generate your `zappa_settings.json` programmatically using the `settings` command with environment variables and command-line arguments:
+
+    $ zappa settings --stage dev
+
+This generates a basic settings file with defaults. You can customize it using `--config` arguments or `ZAPPA_` environment variables:
+
+```bash
+# Using command-line arguments
+$ zappa settings --stage production \
+    --config project_name=myapp \
+    --config memory_size=1024 \
+    --config timeout_seconds=60
+
+# Using environment variables
+$ export ZAPPA_PROJECT_NAME=myapp
+$ export ZAPPA_MEMORY_SIZE=1024
+$ zappa settings --stage production
+
+# Command-line arguments override environment variables
+$ export ZAPPA_MEMORY_SIZE=512
+$ zappa settings --config memory_size=2048  # Uses 2048, not 512
+```
+
+#### Nested JSON Configurations
+
+The `settings` command supports complex nested JSON structures for advanced configurations like CORS options, VPC settings, and environment variables:
+
+```bash
+# Configure CORS with nested JSON
+$ zappa settings --stage production \
+    --config 'cors_options={"allowedOrigins":["*"],"allowedMethods":["GET","POST","PUT"]}'
+
+# Configure VPC settings
+$ zappa settings --stage production \
+    --config 'vpc_config={"SubnetIds":["subnet-123","subnet-456"],"SecurityGroupIds":["sg-789"]}'
+
+# Configure environment variables
+$ zappa settings --stage production \
+    --config 'environment_variables={"DATABASE_URL":"postgres://...","API_KEY":"secret"}'
+
+# Configure Lambda layers
+$ zappa settings --stage production \
+    --config 'layers=["arn:aws:lambda:us-east-1:123:layer:mylayer:1","arn:aws:lambda:us-east-1:123:layer:another:2"]'
+```
+
+You can mix primitive values with complex nested structures:
+
+```bash
+$ zappa settings --stage production \
+    --config project_name=myapp \
+    --config memory_size=1024 \
+    --config binary_support=true \
+    --config 'cors_options={"allowedOrigins":["https://example.com"]}' \
+    --config 'environment_variables={"DB_HOST":"localhost","DB_PORT":"5432"}'
+```
+
+The same nested JSON syntax works with environment variables:
+
+```bash
+$ export ZAPPA_CORS_OPTIONS='{"allowedOrigins":["*"],"allowedMethods":["GET","POST"]}'
+$ export ZAPPA_VPC_CONFIG='{"SubnetIds":["subnet-1","subnet-2"],"SecurityGroupIds":["sg-1"]}'
+$ zappa settings --stage production
+```
 
 Now, you're ready to deploy!
 
@@ -455,6 +530,12 @@ For instance, it can come in handy if you want to create your first `superuser` 
 
     $ zappa invoke staging "from django.contrib.auth import get_user_model; User = get_user_model(); User.objects.create_superuser('username', 'email', 'password')" --raw
 
+If you need to invoke a specific version of your function, you can use the --qualifier option to specify it.
+
+    $ zappa invoke production my_app.my_function --qualifier 123
+
+[Function aliases](https://docs.aws.amazon.com/lambda/latest/dg/configuration-aliases.html) are also supported as qualifiers.
+
 ### Django Management Commands
 
 As a convenience, Zappa can also invoke remote Django 'manage.py' commands with the `manage` command. For instance, to perform the basic Django status check:
@@ -466,6 +547,11 @@ Obviously, this only works for Django projects which have their settings properl
 For commands which have their own arguments, you can also pass the command in as a string, like so:
 
     $ zappa manage production "shell --version"
+
+As with `invoke`, a qualifier can be added to specify the version of your function that's used to execute the command.
+This can be particularly important when running certain commands such as `migrate` directly after a new deployment:
+
+    $ zappa manage production migrate admin --qualifier 123
 
 Commands which require direct user input, such as `createsuperuser`, should be [replaced by commands](http://stackoverflow.com/a/26091252) which use `zappa invoke <env> --raw`.
 
@@ -624,7 +710,9 @@ Optionally you can add [SNS message filters](http://docs.aws.amazon.com/sns/late
        ]
 ```
 
-[SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html) is also pulling messages from a stream. At this time, [only "Standard" queues can trigger lambda events, not "FIFO" queues](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html). Read the AWS Documentation carefully since Lambda calls the SQS DeleteMessage API on your behalf once your function completes successfully.
+[SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html) is also pulling messages from a stream. 
+Read the [AWS Documentation](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html) carefully since Lambda calls the SQS DeleteMessage API on your behalf once your function completes successfully. 
+By default, if your function encounters an error while processing a batch, all messages in that batch become visible in the queue again.
 
 ```javascript
        "events": [
@@ -632,7 +720,7 @@ Optionally you can add [SNS message filters](http://docs.aws.amazon.com/sns/late
                "function": "your_module.process_messages",
                "event_source": {
                     "arn":  "arn:aws:sqs:us-east-1:12341234:your-queue-name-arn",
-                    "batch_size": 10, // Max: 10. Use 1 to trigger immediate processing
+                    "batch_size": 10, // Maximum: 10 for FIFO and 10,000 for Standard. Use 1 to trigger immediate processing
                     "enabled": true // Default is false
                }
            }
@@ -909,6 +997,10 @@ to change Zappa's behavior. Use these at your own risk!
               "maxAge": 0 // The maximum amount of time, in seconds, that web browsers can cache results of a preflight request. default 0.
             }
         },
+        // NOTE: Function URLs do NOT include stage names in their paths. Unlike API Gateway v1/v2 which include
+        // the stage name in the URL (e.g., /dev/mypath), Function URLs route directly to your app (e.g., /mypath).
+        // This means SCRIPT_NAME will be empty for Function URL requests, and PATH_INFO will contain the full path.
+        "apigateway_version": "v1", // optional, API Gateway version to use. Can be "v1" or "v2". Default "v1".
         "architecture": "x86_64", // optional, Set Lambda Architecture, defaults to x86_64. For Graviton 2 use: arm64
         "async_source": "sns", // Source of async tasks. Defaults to "lambda"
         "async_resources": true, // Create the SNS topic and DynamoDB table to use. Defaults to true.
