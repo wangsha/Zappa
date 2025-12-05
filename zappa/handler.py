@@ -550,7 +550,7 @@ class LambdaHandler:
                 if stage:
                     # API Gateway v2 with named stage - rawPath includes the stage
                     script_name = f"/{stage}"
-                else:
+                if host.find("lambda-url") > -1:
                     # Function URL - no stage
                     script_name = ""
 

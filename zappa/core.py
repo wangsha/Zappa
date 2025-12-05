@@ -73,13 +73,6 @@ FUNCTION_URL_PUBLIC_PERMISSION_RULES = (
 
 FUNCTION_URL_PUBLIC_PERMISSION_SIDS = {rule[0] for rule in FUNCTION_URL_PUBLIC_PERMISSION_RULES}
 
-FUNCTION_URL_PUBLIC_PERMISSION_RULES = (
-    ("FunctionURLAllowPublicAccess", "lambda:InvokeFunctionUrl", True),
-    ("FunctionURLAllowPublicAccessInvoke", "lambda:InvokeFunction", False),
-)
-
-FUNCTION_URL_PUBLIC_PERMISSION_SIDS = {rule[0] for rule in FUNCTION_URL_PUBLIC_PERMISSION_RULES}
-
 # Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#apigateway_region
 API_GATEWAY_REGIONS = [
     "us-east-1",
