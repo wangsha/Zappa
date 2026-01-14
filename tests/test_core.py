@@ -3527,6 +3527,44 @@ class TestZappa(unittest.TestCase):
             capacity_provider_config,
         )
 
+    def test_wait_for_capacity_provider_response(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        expected = {"FunctionVersions": []}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.return_value = expected
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            capacity_provider_name="provider",
+            marker="next",
+            max_items=50,
+            max_attempts=2,
+        )
+
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.assert_called_with(
+            CapacityProviderName="provider",
+            Marker="next",
+            MaxItems=50,
+        )
+        self.assertEqual(result, expected)
+
+    def test_wait_for_capacity_provider_response_retries(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        error = botocore.exceptions.ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ListFunctionVersionsByCapacityProvider"
+        )
+        success = {"FunctionVersions": [{"FunctionVersion": "1"}]}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.side_effect = [error, success]
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            capacity_provider_name="provider",
+            max_attempts=2,
+            delay=0,
+        )
+
+        self.assertEqual(result, success)
+        self.assertEqual(zappa_core.lambda_client.list_function_versions_by_capacity_provider.call_count, 2)
+
     def test_create_lambda_capacity_provider_rejects_vpc(self):
         zappa_core = Zappa(load_credentials=False)
         zappa_core.credentials_arn = "arn:aws:iam::123:role/zappa"

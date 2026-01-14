@@ -1495,6 +1495,7 @@ class Zappa:
 
         if capacity_provider_config:
             kwargs["CapacityProviderConfig"] = capacity_provider_config
+            kwargs.pop("VpcConfig")
 
         if lambda_aws_config.get("PackageType", None) != "Image":
             kwargs.update(
@@ -1508,6 +1509,14 @@ class Zappa:
         response = self.lambda_client.update_function_configuration(**kwargs)
 
         resource_arn = response["FunctionArn"]
+        if capacity_provider_config:
+            # wait for function to be active, otherwise update function url settings will fail
+            capacity_provider_arn = capacity_provider_config['LambdaManagedInstancesCapacityProviderConfig']['CapacityProviderArn']
+            capacity_provider_name = capacity_provider_arn.split("capacity-provider:", 1)[1]
+            self.wait_for_capacity_provider_response(f"{response["FunctionArn"]}", capacity_provider_name)
+            # publish to latest
+            response = self.lambda_client.publish_version(FunctionName=function_name, PublishTo='LATEST_PUBLISHED')
+            self.wait_for_capacity_provider_response(f"{response["FunctionArn"]}", capacity_provider_name)
 
         if self.tags:
             self.lambda_client.tag_resource(Resource=resource_arn, Tags=self.tags)
@@ -1595,6 +1604,74 @@ class Zappa:
         waiter = self.lambda_client.get_waiter("function_updated")
         logger.info(f"Waiting for lambda function [{function_name}] to be updated...")
         waiter.wait(FunctionName=function_name)
+
+    def wait_for_capacity_provider_response(self, function_arn: str, capacity_provider_name: str):
+        """
+        Poll list_function_versions_by_capacity_provider until the target function version is:
+        - Active  -> return the matching entry (and the last full response seen)
+        - Failed  -> raise RuntimeError immediately
+        """
+        max_attempts = 30
+        delay_seconds = 3
+        def iter_all_function_versions():
+            """Yield items across all pages."""
+            paginator = self.lambda_client.get_paginator("list_function_versions_by_capacity_provider")
+            for page in paginator.paginate(CapacityProviderName=capacity_provider_name, PaginationConfig={"PageSize": 50}):
+                for item in page.get("FunctionVersions", []):
+                    yield item, page
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Find matching function version item across pages
+                found_item = None
+                last_page = None
+
+                for item, page in iter_all_function_versions():
+
+                    print(item)
+                    last_page = page
+                    arn = item.get("FunctionArn", "")
+                    if arn.find(function_arn) > -1:
+                        found_item = item
+                        break
+
+                # If not found yet, keep polling
+                if not found_item:
+                    # Optional: print the last page we saw for debugging
+                    # print(json.dumps(last_page or {}, indent=2))
+                    time.sleep(delay_seconds)
+                    continue
+
+                state = found_item.get("State")
+                if state == "Active":
+                    # Return something useful: the matched entry + a compact view of the page
+                    return {
+                        "CapacityProviderName": capacity_provider_name,
+                        "MatchedFunction": found_item,
+                        "LastSeenPage": last_page,
+                    }
+
+                if state == "Failed":
+                    raise RuntimeError(
+                        f"Function version [{found_item.get('FunctionArn')}] entered Failed state "
+                        f"under capacity provider [{capacity_provider_name}]."
+                    )
+
+                # Pending / Deleting / etc: keep polling
+                print(f"Attempt {attempt}/{max_attempts}: {found_item.get('FunctionArn')} state={state}")
+                time.sleep(delay_seconds)
+
+            except botocore.exceptions.ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code")
+                if error_code in ("ThrottlingException", "TooManyRequestsException") and attempt < max_attempts:
+                    time.sleep(delay_seconds)
+                    continue
+                raise
+
+        raise TimeoutError(
+            f"Timed out waiting for function [{function_arn}] to become Active "
+            f"under capacity provider [{capacity_provider_name}] after {max_attempts} attempts."
+        )
 
     def get_lambda_function(self, function_name):
         """
