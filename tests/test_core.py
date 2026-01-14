@@ -3543,15 +3543,90 @@ class TestZappa(unittest.TestCase):
 
         result = zappa_core.wait_for_capacity_provider_response(
             capacity_provider_name="provider",
-            marker="next",
-            max_items=50,
-            max_attempts=2,
         )
 
         zappa_core.lambda_client.list_function_versions_by_capacity_provider.assert_called_with(
             CapacityProviderName="provider",
-            Marker="next",
-            MaxItems=50,
+        )
+        self.assertEqual(result, expected)
+
+    def test_wait_for_capacity_provider_response_waits_until_active(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        function_arn = "arn:aws:lambda:us-east-1:123:function:test:1"
+        pending = {"FunctionVersions": [{"FunctionArn": function_arn, "State": "Pending"}]}
+        active = {"FunctionVersions": [{"FunctionArn": function_arn, "State": "Active"}]}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.side_effect = [pending, active]
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            capacity_provider_name="provider",
+            function_arn=function_arn,
+            function_state="Active",
+            max_attempts=2,
+            delay_seconds=0,
+        )
+
+        self.assertEqual(result, active)
+        self.assertEqual(zappa_core.lambda_client.list_function_versions_by_capacity_provider.call_count, 2)
+
+    def test_wait_for_capacity_provider_response_waits_until_empty(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        function_arn = "arn:aws:lambda:us-east-1:123:function:test:1"
+        present = {"FunctionVersions": [{"FunctionArn": function_arn, "State": "Pending"}]}
+        gone = {"FunctionVersions": []}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.side_effect = [present, gone]
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            capacity_provider_name="provider",
+            function_arn=function_arn,
+            function_state="Empty",
+            max_attempts=2,
+            delay_seconds=0,
+        )
+
+        self.assertEqual(result, gone)
+        self.assertEqual(zappa_core.lambda_client.list_function_versions_by_capacity_provider.call_count, 2)
+
+    def test_wait_for_capacity_provider_response_exits_on_failed(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        function_arn = "arn:aws:lambda:us-east-1:123:function:test:1"
+        failed = {"FunctionVersions": [{"FunctionArn": function_arn, "State": "Failed"}]}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.return_value = failed
+
+        with self.assertRaises(RuntimeError):
+            zappa_core.wait_for_capacity_provider_response(
+                capacity_provider_name="provider",
+                function_arn=function_arn,
+                function_state="Active",
+                max_attempts=1,
+                delay_seconds=0,
+            )
+
+        with self.assertRaises(RuntimeError):
+            zappa_core.wait_for_capacity_provider_response(
+                capacity_provider_name="provider",
+                function_arn=function_arn,
+                function_state="Empty",
+                max_attempts=1,
+                delay_seconds=0,
+            )
+
+    def test_wait_for_capacity_provider_response_passes_marker(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        expected = {"FunctionVersions": []}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.return_value = expected
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            capacity_provider_name="provider",
+            marker="m",
+        )
+
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.assert_called_with(
+            CapacityProviderName="provider",
+            Marker="m",
         )
         self.assertEqual(result, expected)
 
@@ -3567,7 +3642,7 @@ class TestZappa(unittest.TestCase):
         result = zappa_core.wait_for_capacity_provider_response(
             capacity_provider_name="provider",
             max_attempts=2,
-            delay=0,
+            delay_seconds=0,
         )
 
         self.assertEqual(result, success)
