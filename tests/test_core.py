@@ -894,6 +894,23 @@ class TestZappa(unittest.TestCase):
             capacity_provider_config,
         )
 
+    def test_update_capacity_provider_rejects_vpc(self):
+        z = Zappa(load_credentials=False)
+        z.credentials_arn = object()
+        z.lambda_client = mock.MagicMock()
+
+        with self.assertRaises(ValueError):
+            z.update_lambda_configuration(
+                "arn",
+                "name",
+                "handler",
+                vpc_config={"SubnetIds": ["subnet-1"], "SecurityGroupIds": ["sg-1"]},
+                capacity_provider_config={
+                    "LambdaManagedInstancesCapacityProviderConfig": {"CapacityProviderArn": "arn:aws:lambda:::capacity"}
+                },
+                wait=False,
+            )
+
     def test_snap_start_configuration(self):
         """
         Test that SnapStart configuration is correctly set in Lambda configuration.
@@ -3509,6 +3526,23 @@ class TestZappa(unittest.TestCase):
             zappa_core.lambda_client.create_function.call_args[1]["CapacityProviderConfig"],
             capacity_provider_config,
         )
+
+    def test_create_lambda_capacity_provider_rejects_vpc(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.credentials_arn = "arn:aws:iam::123:role/zappa"
+        zappa_core.lambda_client = mock.MagicMock()
+
+        with self.assertRaises(ValueError):
+            zappa_core.create_lambda_function(
+                function_name="abc",
+                handler="handler.lambda_handler",
+                bucket="bucket",
+                s3_key="key",
+                capacity_provider_config={
+                    "LambdaManagedInstancesCapacityProviderConfig": {"CapacityProviderArn": "arn:aws:lambda:::capacity"}
+                },
+                vpc_config={"SubnetIds": ["subnet-1"], "SecurityGroupIds": ["sg-1"]},
+            )
 
     @mock.patch("botocore.client")
     def test_set_lambda_concurrency(self, client):

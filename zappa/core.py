@@ -1238,6 +1238,12 @@ class Zappa:
             layers = []
 
         uses_capacity_provider = bool(capacity_provider_config)
+        uses_vpc = bool(vpc_config and (vpc_config.get("SubnetIds") or vpc_config.get("SecurityGroupIds")))
+        if uses_capacity_provider and uses_vpc:
+            raise ValueError(
+                "Lambda capacity providers cannot be used with VPC configurations. "
+                "Remove VPC settings or disable the capacity provider."
+            )
 
         kwargs = dict(
             FunctionName=function_name,
@@ -1449,6 +1455,14 @@ class Zappa:
             aws_environment_variables = {}
         if not layers:
             layers = []
+
+        uses_capacity_provider = bool(capacity_provider_config)
+        uses_vpc = bool(vpc_config and (vpc_config.get("SubnetIds") or vpc_config.get("SecurityGroupIds")))
+        if uses_capacity_provider and uses_vpc:
+            raise ValueError(
+                "Lambda capacity providers cannot be used with VPC configurations. "
+                "Remove VPC settings or disable the capacity provider."
+            )
 
         if wait:
             # Wait until function is ready, otherwise expected keys will be missing from 'lambda_aws_config'.
