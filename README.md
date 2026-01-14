@@ -17,14 +17,7 @@
 - [Installation and Configuration](#installation-and-configuration)
   - [Running the Initial Setup / Settings](#running-the-initial-setup--settings)
   - [Alternative: Generating Settings via CLI](#alternative-generating-settings-via-cli)
-- [Using command-line arguments](#using-command-line-arguments)
-- [Using environment variables](#using-environment-variables)
-- [Command-line arguments override environment variables](#command-line-arguments-override-environment-variables)
     - [Nested JSON Configurations](#nested-json-configurations)
-- [Configure CORS with nested JSON](#configure-cors-with-nested-json)
-- [Configure VPC settings](#configure-vpc-settings)
-- [Configure environment variables](#configure-environment-variables)
-- [Configure Lambda layers](#configure-lambda-layers)
 - [Basic Usage](#basic-usage)
   - [Initial Deployments](#initial-deployments)
   - [Updates](#updates)
@@ -84,6 +77,12 @@
   - [Globally Available Server-less Architectures](#globally-available-server-less-architectures)
   - [Raising AWS Service Limits](#raising-aws-service-limits)
   - [Dead Letter Queues](#dead-letter-queues)
+  - [Elastic File System (EFS)](#elastic-file-system-efs)
+    - [Basic Configuration](#basic-configuration)
+    - [Configuration Options](#configuration-options)
+    - [Security Group Configuration](#security-group-configuration)
+    - [Accessing EFS in Your Code](#accessing-efs-in-your-code)
+    - [Notes](#notes)
   - [Unique Package ID](#unique-package-id)
   - [Application Load Balancer Event Source](#application-load-balancer-event-source)
   - [Endpoint Configuration](#endpoint-configuration)
@@ -145,7 +144,7 @@ And finally, Zappa is **super easy to use**. You can deploy your application wit
 
 ## Installation and Configuration
 
-_Before you begin, make sure you are running Python 3.8/3.9/3.10/3.11/3.12/3.13/3.14 and you have a valid AWS account and your [AWS credentials file](https://blogs.aws.amazon.com/security/post/Tx3D6U6WSFGOK2H/A-New-and-Standardized-Way-to-Manage-Credentials-in-the-AWS-SDKs) is properly installed._
+_Before you begin, make sure you are running Python 3.8/3.9/3.10/3.11/3.12/3.13 and you have a valid AWS account and your [AWS credentials file](https://blogs.aws.amazon.com/security/post/Tx3D6U6WSFGOK2H/A-New-and-Standardized-Way-to-Manage-Credentials-in-the-AWS-SDKs) is properly installed._
 
 **Zappa** can easily be installed through pip, like so:
 
@@ -206,19 +205,26 @@ Instead of using the interactive `init` command, you can also generate your `zap
 
 This generates a basic settings file with defaults. You can customize it using `--config` arguments or `ZAPPA_` environment variables:
 
+> Using command-line arguments
+
 ```bash
-# Using command-line arguments
 $ zappa settings --stage production \
     --config project_name=myapp \
     --config memory_size=1024 \
     --config timeout_seconds=60
+```
 
-# Using environment variables
+> Using environment variables
+
+```bash
 $ export ZAPPA_PROJECT_NAME=myapp
 $ export ZAPPA_MEMORY_SIZE=1024
 $ zappa settings --stage production
+```
 
-# Command-line arguments override environment variables
+> Command-line arguments override environment variables
+
+```bash
 $ export ZAPPA_MEMORY_SIZE=512
 $ zappa settings --config memory_size=2048  # Uses 2048, not 512
 ```
@@ -227,20 +233,30 @@ $ zappa settings --config memory_size=2048  # Uses 2048, not 512
 
 The `settings` command supports complex nested JSON structures for advanced configurations like CORS options, VPC settings, and environment variables:
 
+> Configure CORS with nested JSON
+
 ```bash
-# Configure CORS with nested JSON
 $ zappa settings --stage production \
     --config 'cors_options={"allowedOrigins":["*"],"allowedMethods":["GET","POST","PUT"]}'
+```
 
-# Configure VPC settings
+> Configure VPC settings
+
+```bash
 $ zappa settings --stage production \
     --config 'vpc_config={"SubnetIds":["subnet-123","subnet-456"],"SecurityGroupIds":["sg-789"]}'
+```
 
-# Configure environment variables
+> Configure environment variables
+
+```bash
 $ zappa settings --stage production \
     --config 'environment_variables={"DATABASE_URL":"postgres://...","API_KEY":"secret"}'
+```
 
-# Configure Lambda layers
+> Configure Lambda layers
+
+```bash
 $ zappa settings --stage production \
     --config 'layers=["arn:aws:lambda:us-east-1:123:layer:mylayer:1","arn:aws:lambda:us-east-1:123:layer:another:2"]'
 ```
@@ -522,7 +538,7 @@ For instance, suppose you have a basic application in a file called "my_app.py",
 
 Any remote print statements made and the value the function returned will then be printed to your local console. **Nifty!**
 
-You can also invoke interpretable Python 3.8/3.9/3.10/3.11/3.12/3.13/3.14 strings directly by using `--raw`, like so:
+You can also invoke interpretable Python 3.8/3.9/3.10/3.11/3.12/3.13 strings directly by using `--raw`, like so:
 
     $ zappa invoke production "print(1 + 2 + 3)" --raw
 
@@ -1090,6 +1106,7 @@ to change Zappa's behavior. Use these at your own risk!
         "manage_roles": true, // Have Zappa automatically create and define IAM execution roles and policies. Default true. If false, you must define your own IAM Role and role_name setting.
         "memory_size": 512, // Lambda function memory in MB. Default 512.
         "ephemeral_storage": { "Size": 512 }, // Lambda function ephemeral_storage size in MB, Default 512, Max 10240
+        "efs_config": [{ "Arn": "arn:aws:elasticfilesystem:...:access-point/fsap-...", "LocalMountPath": "/mnt/data" }], // Optional EFS configuration. See EFS section for details.
         "num_retained_versions":null, // Indicates the number of old versions to retain for the lambda. If absent, keeps all the versions of the function.
         "payload_compression": true, // Whether or not to enable API gateway payload compression (default: true)
         "payload_minimum_compression_size": 0, // The threshold size (in bytes) below which payload compression will not be applied (default: 0)
@@ -1100,7 +1117,7 @@ to change Zappa's behavior. Use these at your own risk!
         "role_name": "MyLambdaRole", // Name of Zappa execution role. Default <project_name>-<env>-ZappaExecutionRole. To use a different, pre-existing policy, you must also set manage_roles to false.
         "role_arn": "arn:aws:iam::12345:role/app-ZappaLambdaExecutionRole", // ARN of Zappa execution role. Default to None. To use a different, pre-existing policy, you must also set manage_roles to false. This overrides role_name. Use with temporary credentials via GetFederationToken.
         "route53_enabled": true, // Have Zappa update your Route53 Hosted Zones when certifying with a custom domain. Default true.
-        "runtime": "python3.14", // Python runtime to use on Lambda. Can be one of: "python3.8", "python3.9", "python3.10", "python3.11", "python3.12", "python3.13", or "python3.14". Defaults to whatever the current Python being used is.
+        "runtime": "python3.13", // Python runtime to use on Lambda. Can be one of: "python3.8", "python3.9", "python3.10", "python3.11", "python3.12", or "python3.13". Defaults to whatever the current Python being used is.
         "s3_bucket": "dev-bucket", // Zappa zip bucket,
         "slim_handler": false, // Useful if project >50M. Set true to just upload a small handler to Lambda and load actual project from S3 at runtime. Default false.
         "snap_start": "PublishedVersions", // Enable Lambda SnapStart for faster cold starts. Can be "PublishedVersions" or "None". Default "None".
@@ -1534,6 +1551,131 @@ To avoid this, you can file a [service ticket](https://console.aws.amazon.com/su
 If you want to utilise [AWS Lambda's Dead Letter Queue feature](http://docs.aws.amazon.com/lambda/latest/dg/dlq.html) simply add the key `dead_letter_arn`, with the value being the complete ARN to the corresponding SNS topic or SQS queue in your `zappa_settings.json`.
 
 You must have already created the corresponding SNS/SQS topic/queue, and the Lambda function execution role must have been provisioned with read/publish/sendMessage access to the DLQ resource.
+
+### Elastic File System (EFS)
+
+Zappa supports mounting [Amazon Elastic File System (EFS)](https://aws.amazon.com/efs/) to your Lambda functions, providing persistent, shared storage that persists across Lambda invocations. This is useful for applications that need to read or write large files, share data between Lambda invocations, or store ML models.
+
+#### Basic Configuration
+
+EFS requires your Lambda to run inside a VPC. Add both `vpc_config` and `efs_config` to your settings:
+
+```javascript
+{
+    "dev": {
+        "vpc_config": {
+            "SubnetIds": ["subnet-12345678", "subnet-87654321"],
+            "SecurityGroupIds": ["sg-12345678"]
+        },
+        "efs_config": true  // Auto-create EFS with default mount at /mnt/efs
+    }
+}
+```
+
+#### Configuration Options
+
+The `efs_config` setting accepts several formats:
+
+```javascript
+// Minimal: auto-create EFS mounted at /mnt/efs
+"efs_config": true
+
+// Custom mount path (must start with /mnt/)
+"efs_config": {
+    "LocalMountPath": "/mnt/data"
+}
+
+// Full configuration with performance options
+"efs_config": {
+    "LocalMountPath": "/mnt/data",
+    "ThroughputMode": "bursting",
+    "PerformanceMode": "generalPurpose"
+}
+
+// Use existing EFS access point
+"efs_config": {
+    "Arn": "arn:aws:elasticfilesystem:us-east-1:123456789:access-point/fsap-12345678",
+    "LocalMountPath": "/mnt/models"
+}
+
+// Multiple mounts
+"efs_config": [
+    { "LocalMountPath": "/mnt/data" },
+    { "Arn": "arn:aws:elasticfilesystem:...:access-point/fsap-...", "LocalMountPath": "/mnt/models" }
+]
+```
+
+**Available Options and Defaults:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `LocalMountPath` | Mount path inside Lambda (must start with `/mnt/`) | `/mnt/efs` |
+| `Arn` | Existing EFS access point ARN. If omitted, Zappa auto-creates EFS resources | Auto-create |
+| `ThroughputMode` | `"bursting"` or `"provisioned"` | `"bursting"` |
+| `PerformanceMode` | `"generalPurpose"` or `"maxIO"` | `"generalPurpose"` |
+
+**Note:** EFS storage is elastic - it automatically grows and shrinks based on usage. No size configuration is required.
+
+#### Security Group Configuration
+
+**Important**: For Lambda to connect to EFS, the security group must allow NFS traffic (TCP port 2049) between Lambda and the EFS mount targets. The Lambda function and EFS mount targets typically share the same security group, so you need a self-referencing ingress rule.
+
+If you encounter errors like:
+```
+The function couldn't connect to the Amazon EFS file system with access point arn:aws:elasticfilesystem:...
+Check your network configuration and try again.
+```
+
+Add an ingress rule to your security group allowing TCP port 2049 from itself:
+
+**AWS CLI:**
+```bash
+aws ec2 authorize-security-group-ingress \
+    --group-id sg-12345678 \
+    --protocol tcp \
+    --port 2049 \
+    --source-group sg-12345678
+```
+
+**CloudFormation/Terraform:**
+
+> CloudFormation example
+
+```yaml
+LambdaSecurityGroupNfsIngress:
+  Type: AWS::EC2::SecurityGroupIngress
+  Properties:
+    GroupId: !Ref LambdaSecurityGroup
+    IpProtocol: tcp
+    FromPort: 2049
+    ToPort: 2049
+    SourceSecurityGroupId: !Ref LambdaSecurityGroup
+```
+
+#### Accessing EFS in Your Code
+
+Once configured, access the mounted filesystem like any local directory:
+
+```python
+import os
+
+def handler(event, context):
+    # Write to EFS
+    with open('/mnt/data/myfile.txt', 'w') as f:
+        f.write('Hello from Lambda!')
+
+    # Read from EFS
+    files = os.listdir('/mnt/data')
+    return {'files': files}
+```
+
+#### Notes
+
+- Mount paths must start with `/mnt/`
+- Each mount path must be unique within a Lambda function
+- When `manage_roles` is true, Zappa automatically adds the required EFS permissions to the Lambda execution role
+- Auto-created EFS resources are tagged with `CreatedBy: Zappa` for easy identification
+- EFS provides a POSIX-compliant file system, so standard file operations work as expected
 
 ### Unique Package ID
 

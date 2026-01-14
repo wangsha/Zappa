@@ -35,6 +35,7 @@ from setuptools import find_packages
 from tqdm import tqdm
 
 from .utilities import (
+    DEFAULT_EFS_MOUNT_POINT,
     add_event_source,
     conflicts_with_a_neighbouring_module,
     contains_python_files_or_subdirs,
@@ -172,10 +173,28 @@ def build_manylinux_wheel_file_match_pattern(runtime: str, architecture: str) ->
     else:
         raise ValueError(f"Invalid 'architecture', must be one of {VALID_ARCHITECTURES}, got: {architecture}")
 
-    manylinux_wheel_file_match = (
-        rf'^.*{python_tag}-(manylinux_\d+_\d+_({"|".join(valid_platform_tags)})[.])?'
-        rf'({"|".join(manylinux_legacy_tags)})_({"|".join(valid_platform_tags)})[.]whl$'
-    )
+    # Support compressed platform tags as defined by PEP 425 and PEP 600.
+    #
+    # The platform tag portion of a wheel filename may consist of one or more
+    # platform tags separated by dots, representing a logical OR of supported
+    # platforms.
+    #
+    # Supported forms include:
+    #   - legacy manylinux tags (manylinux2014, manylinux2010, manylinux1)
+    #   - PEP 600 manylinux tags (manylinux_2_x)
+    #   - any combination of the above, in any order
+    #
+    # Ordering of platform tags is not strictly validated, as real-world wheels
+    # may not follow a canonical sort order.
+    # Examples:
+    #   - manylinux2014_x86_64.whl (legacy only)
+    #   - manylinux2014_x86_64.manylinux_2_17_x86_64.whl (sorted: legacy first)
+    #   - manylinux_2_17_x86_64.manylinux2014_x86_64.whl (unsorted: PEP 600 first)
+    legacy_tag = rf'({"|".join(manylinux_legacy_tags)})_({"|".join(valid_platform_tags)})'
+    pep600_tag = rf'manylinux_\d+_\d+_({"|".join(valid_platform_tags)})'
+    single_platform_tag = rf"({legacy_tag}|{pep600_tag})"
+    platform_tags = rf"{single_platform_tag}(\.{single_platform_tag})*"
+    manylinux_wheel_file_match = rf"^.*{python_tag}-{python_tag}-{platform_tags}\.whl$"
 
     # The 'abi3' tag is a compiled distribution format designed for compatibility across multiple Python 3 versions.
     # An abi3 wheel is built against the stable ABI (Application Binary Interface) of a minimum supported Python version.
@@ -187,7 +206,7 @@ def build_manylinux_wheel_file_match_pattern(runtime: str, architecture: str) ->
     manylinux_wheel_abi3_file_match = (
         # rf'^.*cp3.-abi3-manylinux({"|".join(manylinux_suffixes)})_({"|".join(valid_platform_tags)}).whl$'
         rf'^.*cp3({"|".join(abi_valid_python_minor_versions)})-abi3-'
-        rf'manylinux(({"|".join(manylinux_suffixes)})_({"".join(valid_platform_tags)})(\.|))+.whl$'
+        rf'manylinux(({"|".join(manylinux_suffixes)})_({"|".join(valid_platform_tags)})(\.|))+.whl$'
     )
     combined_match_pattern = rf"({manylinux_wheel_file_match})|({manylinux_wheel_abi3_file_match})"
     manylinux_wheel_file_match_pattern = re.compile(combined_match_pattern)
@@ -305,7 +324,6 @@ class Zappa:
             self.dynamodb_client = self.boto_client("dynamodb")
             self.cognito_client = self.boto_client("cognito-idp")
             self.sts_client = self.boto_client("sts")
-            self.cloudfront_client = self.boto_client("cloudfront")
 
         self.tags = tags
         self.cf_template = troposphere.Template()
@@ -1041,6 +1059,148 @@ class Zappa:
             return False
 
     ##
+    # EFS
+    ##
+
+    def create_efs(
+        self,
+        lambda_name: str,
+        vpc_config: dict,
+        mount_path: str = DEFAULT_EFS_MOUNT_POINT,
+        throughput_mode: str = "bursting",
+        performance_mode: str = "generalPurpose",
+    ) -> str:
+        """
+        Create EFS file system, mount targets, and access point for Lambda.
+        Returns the access point ARN.
+        """
+        # Generate unique name based on mount path (e.g., /mnt/data -> data, /mnt/ -> default)
+        mount_suffix = mount_path.replace("/mnt/", "").rstrip("/") or "default"
+        efs_name = f"{lambda_name}-efs-{mount_suffix}"
+
+        # Check if EFS already exists (by name tag)
+        existing = self.efs_client.describe_file_systems()
+        file_system_id = None
+        for fs in existing["FileSystems"]:
+            tags = {t["Key"]: t["Value"] for t in fs.get("Tags", [])}
+            if tags.get("Name") == efs_name:
+                file_system_id = fs["FileSystemId"]
+                logger.info(f"Using existing EFS: {file_system_id}")
+                break
+
+        if file_system_id is None:
+            # Create new file system
+            logger.info(f"Creating EFS file system: {efs_name}")
+            response = self.efs_client.create_file_system(
+                CreationToken=efs_name,
+                PerformanceMode=performance_mode,
+                ThroughputMode=throughput_mode,
+                Encrypted=True,
+                Tags=[
+                    {"Key": "Name", "Value": efs_name},
+                    {"Key": "CreatedBy", "Value": "Zappa"},
+                ],
+            )
+            file_system_id = response["FileSystemId"]
+
+            # Wait for file system to be available
+            while True:
+                fs_response = self.efs_client.describe_file_systems(FileSystemId=file_system_id)
+                if fs_response["FileSystems"][0]["LifeCycleState"] == "available":
+                    break
+                time.sleep(5)
+
+        # Create mount targets for each subnet
+        security_group_ids = vpc_config.get("SecurityGroupIds", [])
+        for subnet_id in vpc_config.get("SubnetIds", []):
+            try:
+                self.efs_client.create_mount_target(
+                    FileSystemId=file_system_id,
+                    SubnetId=subnet_id,
+                    SecurityGroups=security_group_ids,
+                )
+                logger.info(f"Created mount target in subnet: {subnet_id}")
+            except self.efs_client.exceptions.MountTargetConflict:
+                logger.info(f"Mount target already exists in subnet: {subnet_id}")
+
+        # Wait for mount targets to be available
+        while True:
+            targets = self.efs_client.describe_mount_targets(FileSystemId=file_system_id)
+            if all(t["LifeCycleState"] == "available" for t in targets["MountTargets"]):
+                break
+            time.sleep(5)
+
+        # Create or get access point
+        access_point_name = f"{lambda_name}-ap-{mount_suffix}"
+        access_points = self.efs_client.describe_access_points(FileSystemId=file_system_id)
+        for ap in access_points["AccessPoints"]:
+            tags = {t["Key"]: t["Value"] for t in ap.get("Tags", [])}
+            if tags.get("Name") == access_point_name:
+                logger.info(f"Using existing access point: {ap['AccessPointId']}")
+                return ap["AccessPointArn"]
+
+        # Create new access point
+        logger.info(f"Creating EFS access point: {access_point_name}")
+        response = self.efs_client.create_access_point(
+            FileSystemId=file_system_id,
+            PosixUser={
+                "Uid": 1000,
+                "Gid": 1000,
+            },
+            RootDirectory={
+                "Path": "/lambda",
+                "CreationInfo": {
+                    "OwnerUid": 1000,
+                    "OwnerGid": 1000,
+                    "Permissions": "755",
+                },
+            },
+            Tags=[
+                {"Key": "Name", "Value": access_point_name},
+                {"Key": "CreatedBy", "Value": "Zappa"},
+            ],
+        )
+
+        return response["AccessPointArn"]
+
+    def delete_efs(self, lambda_name: str):
+        """
+        Delete all EFS resources created by Zappa for this Lambda.
+        Finds and deletes all EFS file systems with names matching the pattern.
+        """
+        # Find all file systems created by Zappa for this Lambda
+        file_systems = self.efs_client.describe_file_systems()
+        for fs in file_systems["FileSystems"]:
+            tags = {t["Key"]: t["Value"] for t in fs.get("Tags", [])}
+            fs_name = tags.get("Name", "")
+            # Match pattern: {lambda_name}-efs-{suffix}
+            if fs_name.startswith(f"{lambda_name}-efs-") and tags.get("CreatedBy") == "Zappa":
+                file_system_id = fs["FileSystemId"]
+
+                # Delete access points
+                access_points = self.efs_client.describe_access_points(FileSystemId=file_system_id)
+                for ap in access_points["AccessPoints"]:
+                    logger.info(f"Deleting access point: {ap['AccessPointId']}")
+                    self.efs_client.delete_access_point(AccessPointId=ap["AccessPointId"])
+
+                # Delete mount targets
+                mount_targets = self.efs_client.describe_mount_targets(FileSystemId=file_system_id)
+                for mt in mount_targets["MountTargets"]:
+                    logger.info(f"Deleting mount target: {mt['MountTargetId']}")
+                    self.efs_client.delete_mount_target(MountTargetId=mt["MountTargetId"])
+
+                # Wait for mount targets to be deleted
+                while True:
+                    targets = self.efs_client.describe_mount_targets(FileSystemId=file_system_id)
+                    if len(targets["MountTargets"]) == 0:
+                        break
+                    time.sleep(5)
+
+                # Delete file system
+                logger.info(f"Deleting EFS file system: {file_system_id}")
+                self.efs_client.delete_file_system(FileSystemId=file_system_id)
+
+    ##
     # Lambda
     ##
 
@@ -1057,7 +1217,7 @@ class Zappa:
         publish=True,
         vpc_config=None,
         dead_letter_config=None,
-        runtime="python3.14",
+        runtime="python3.13",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         snap_start=None,
@@ -1077,6 +1237,8 @@ class Zappa:
             vpc_config = {}
         if not dead_letter_config:
             dead_letter_config = {}
+        if not efs_config:
+            efs_config = []
         if not self.credentials_arn:
             self.get_credentials_arn()
         if not aws_environment_variables:
@@ -1098,6 +1260,7 @@ class Zappa:
             Publish=publish,
             VpcConfig=vpc_config,
             DeadLetterConfig=dead_letter_config,
+            FileSystemConfigs=efs_config,
             Environment={"Variables": aws_environment_variables},
             KMSKeyArn=aws_kms_key_arn,
             TracingConfig={"Mode": "Active" if self.xray_tracing else "PassThrough"},
@@ -1250,7 +1413,7 @@ class Zappa:
         ephemeral_storage={"Size": 512},
         publish=True,
         vpc_config=None,
-        runtime="python3.14",
+        runtime="python3.13",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         layers=None,
@@ -1266,6 +1429,8 @@ class Zappa:
 
         if not vpc_config:
             vpc_config = {}
+        if not efs_config:
+            efs_config = []
         if not self.credentials_arn:
             self.get_credentials_arn()
         if not aws_kms_key_arn:
@@ -1297,6 +1462,7 @@ class Zappa:
             "MemorySize": memory_size,
             "EphemeralStorage": ephemeral_storage,
             "VpcConfig": vpc_config,
+            "FileSystemConfigs": efs_config,
             "Environment": {"Variables": aws_environment_variables},
             "KMSKeyArn": aws_kms_key_arn,
             "TracingConfig": {"Mode": "Active" if self.xray_tracing else "PassThrough"},
@@ -3113,18 +3279,22 @@ class Zappa:
 
     def _clear_policy(self, lambda_name):
         """
-        Remove obsolete policy statements to prevent policy from bloating over the limit after repeated updates.
+        Remove obsolete CloudWatch Events policy statements to prevent policy from bloating
+        over the limit after repeated updates.
+
+        Only removes permissions for events.amazonaws.com (created by schedule_events).
+        Preserves permissions for API Gateway, Function URLs, and other services.
         """
         try:
             policy_response = self.lambda_client.get_policy(FunctionName=lambda_name)
             if policy_response["ResponseMetadata"]["HTTPStatusCode"] == 200:
                 statement = json.loads(policy_response["Policy"])["Statement"]
                 for s in statement:
-                    if s["Sid"].startswith("zappa-"):
-                        logger.debug(f"delete policy {s['Sid']}-{s['Principal']}")
-                        delete_response = self.lambda_client.remove_permission(FunctionName=lambda_name, StatementId=s["Sid"])
-                        if delete_response["ResponseMetadata"]["HTTPStatusCode"] != 204:
-                            logger.error("Failed to delete an obsolete policy statement: {}".format(policy_response))
+                    if s["Sid"] in ["FunctionURLAllowPublicAccess"]:
+                        continue
+                    delete_response = self.lambda_client.remove_permission(FunctionName=lambda_name, StatementId=s["Sid"])
+                    if delete_response["ResponseMetadata"]["HTTPStatusCode"] != 204:
+                        logger.error("Failed to delete an obsolete policy statement: {}".format(policy_response))
             else:
                 logger.debug("Failed to load Lambda function policy: {}".format(policy_response))
         except ClientError as e:
