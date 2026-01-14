@@ -1646,8 +1646,8 @@ class Zappa:
 
     def wait_for_capacity_provider_response(
         self,
-        function_arn: str | None = None,
-        capacity_provider_name: str | None = None,
+        function_arn: str,
+        capacity_provider_name: str,
         function_state: str = "Active",
         marker: str | None = None,
         max_attempts: int = 60,
@@ -1668,8 +1668,6 @@ class Zappa:
         normalized_state = (function_state or "").strip().lower()
         if normalized_state not in ("active", "empty"):
             raise ValueError("function_state must be 'Active' or 'Empty'.")
-        if normalized_state == "empty" and not function_arn:
-            raise ValueError("function_arn is required when function_state='Empty'.")
 
         list_kwargs = {"CapacityProviderName": capacity_provider_name}
         if marker:
@@ -1679,6 +1677,7 @@ class Zappa:
         for attempt in range(1, max_attempts + 1):
             try:
                 response = self.lambda_client.list_function_versions_by_capacity_provider(**list_kwargs)
+                logger.info(f"Function Versions: {response}")
                 last_response = response
             except botocore.exceptions.ClientError as e:
                 error_code = e.response.get("Error", {}).get("Code")
@@ -1711,8 +1710,8 @@ class Zappa:
                 )
                 last_response = page
 
+            logger.info(f"{attempt}/{max_attempts} attempts: {normalized_state=}, {matched_item=}")
             if matched_item:
-                logger.info(f"{attempt}/{max_attempts} attempts: {matched_item}")
                 state = matched_item.get("State")
                 if state == "Failed":
                     raise RuntimeError(
