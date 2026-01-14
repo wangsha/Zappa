@@ -1527,13 +1527,35 @@ class Zappa:
 
         resource_arn = response["FunctionArn"]
         if capacity_provider_config:
+            
             # wait for function to be active, otherwise update function url settings will fail
-            capacity_provider_arn = capacity_provider_config['LambdaManagedInstancesCapacityProviderConfig']['CapacityProviderArn']
-            capacity_provider_name = capacity_provider_arn.split("capacity-provider:", 1)[1]
-            self.wait_for_capacity_provider_response(f"{response["FunctionArn"]}", capacity_provider_name)
+            capacity_provider_arn = capacity_provider_config["LambdaManagedInstancesCapacityProviderConfig"][
+                "CapacityProviderArn"
+            ]
+            capacity_provider_name_part = capacity_provider_arn
+            if "capacity-provider/" in capacity_provider_name_part:
+                capacity_provider_name_part = capacity_provider_name_part.split("capacity-provider/", 1)[1]
+            elif "capacity-provider:" in capacity_provider_name_part:
+                capacity_provider_name_part = capacity_provider_name_part.split("capacity-provider:", 1)[1]
+            capacity_provider_name = capacity_provider_name_part.rsplit("/", 1)[-1]
+            self.wait_for_capacity_provider_response(
+                capacity_provider_name=capacity_provider_name,
+                function_arn=response["FunctionArn"],
+                function_state="Active",
+            )
+            # if latest version exists, wait to be deleted
+            self.wait_for_capacity_provider_response(
+                capacity_provider_name=capacity_provider_name,
+                function_arn=f"{response["FunctionArn"]}:$LATEST.PUBLISHED",
+                function_state="Empty",
+            )
             # publish to latest
             response = self.lambda_client.publish_version(FunctionName=function_name, PublishTo='LATEST_PUBLISHED')
-            self.wait_for_capacity_provider_response(f"{response["FunctionArn"]}", capacity_provider_name)
+            self.wait_for_capacity_provider_response(
+                capacity_provider_name=capacity_provider_name,
+                function_arn=response["FunctionArn"],
+                function_state="Active",
+            )
 
         if self.tags:
             self.lambda_client.tag_resource(Resource=resource_arn, Tags=self.tags)
@@ -1622,72 +1644,91 @@ class Zappa:
         logger.info(f"Waiting for lambda function [{function_name}] to be updated...")
         waiter.wait(FunctionName=function_name)
 
-    def wait_for_capacity_provider_response(self, function_arn: str, capacity_provider_name: str):
+    def wait_for_capacity_provider_response(
+        self,
+        function_arn: str,
+        capacity_provider_name: str,
+        function_state: str = "Active",
+        marker: str | None = None,
+        max_attempts: int = 60,
+        delay_seconds: float = 5,
+    ):
         """
-        Poll list_function_versions_by_capacity_provider until the target function version is:
-        - Active  -> return the matching entry (and the last full response seen)
-        - Failed  -> raise RuntimeError immediately
-        """
-        max_attempts = 30
-        delay_seconds = 3
-        def iter_all_function_versions():
-            """Yield items across all pages."""
-            paginator = self.lambda_client.get_paginator("list_function_versions_by_capacity_provider")
-            for page in paginator.paginate(CapacityProviderName=capacity_provider_name, PaginationConfig={"PageSize": 50}):
-                for item in page.get("FunctionVersions", []):
-                    yield item, page
+        Call list_function_versions_by_capacity_provider with retry.
 
+        If function_arn is provided:
+        - function_state="Active": poll until the matching FunctionVersion has State=Active
+        - function_state="Empty": poll until the matching FunctionVersion record is no longer returned
+        In both modes, if the matching record is ever seen in State=Failed, raises RuntimeError.
+        Returns the last API response seen.
+        """
+        if not capacity_provider_name:
+            raise ValueError("capacity_provider_name is required.")
+
+        normalized_state = (function_state or "").strip().lower()
+        if normalized_state not in ("active", "empty"):
+            raise ValueError("function_state must be 'Active' or 'Empty'.")
+
+        list_kwargs = {"CapacityProviderName": capacity_provider_name}
+        if marker:
+            list_kwargs["Marker"] = marker
+
+        last_response = None
         for attempt in range(1, max_attempts + 1):
             try:
-                # Find matching function version item across pages
-                found_item = None
-                last_page = None
-
-                for item, page in iter_all_function_versions():
-
-                    print(item)
-                    last_page = page
-                    arn = item.get("FunctionArn", "")
-                    if arn.find(function_arn) > -1:
-                        found_item = item
-                        break
-
-                # If not found yet, keep polling
-                if not found_item:
-                    # Optional: print the last page we saw for debugging
-                    # print(json.dumps(last_page or {}, indent=2))
-                    time.sleep(delay_seconds)
-                    continue
-
-                state = found_item.get("State")
-                if state == "Active":
-                    # Return something useful: the matched entry + a compact view of the page
-                    return {
-                        "CapacityProviderName": capacity_provider_name,
-                        "MatchedFunction": found_item,
-                        "LastSeenPage": last_page,
-                    }
-
-                if state == "Failed":
-                    raise RuntimeError(
-                        f"Function version [{found_item.get('FunctionArn')}] entered Failed state "
-                        f"under capacity provider [{capacity_provider_name}]."
-                    )
-
-                # Pending / Deleting / etc: keep polling
-                print(f"Attempt {attempt}/{max_attempts}: {found_item.get('FunctionArn')} state={state}")
-                time.sleep(delay_seconds)
-
+                response = self.lambda_client.list_function_versions_by_capacity_provider(**list_kwargs)
+                logger.info(json.dumps(response, indent=2))
+                last_response = response
             except botocore.exceptions.ClientError as e:
                 error_code = e.response.get("Error", {}).get("Code")
-                if error_code in ("ThrottlingException", "TooManyRequestsException") and attempt < max_attempts:
+                if error_code in ("ThrottlingException", "Throttling", "TooManyRequestsException") and attempt < max_attempts:
                     time.sleep(delay_seconds)
                     continue
                 raise
 
+            if not function_arn:
+                return response
+
+            matched_item = None
+            page = response or {}
+            while True:
+                for item in (page.get("FunctionVersions") or []):
+                    arn = item.get("FunctionArn") or ""
+                    if function_arn in arn:
+                        matched_item = item
+                        break
+                if matched_item:
+                    break
+
+                next_marker = page.get("NextMarker")
+                if not next_marker:
+                    break
+
+                page = self.lambda_client.list_function_versions_by_capacity_provider(
+                    CapacityProviderName=capacity_provider_name,
+                    Marker=next_marker,
+                )
+                last_response = page
+
+            logger.info(f"{attempt}/{max_attempts} attempts: {function_arn=} {normalized_state=}, {matched_item=}")
+            if matched_item:
+                state = matched_item.get("State")
+                if state == "Failed":
+                    raise RuntimeError(
+                        f"Function version [{matched_item.get('FunctionArn')}] entered Failed state under "
+                        f"capacity provider [{capacity_provider_name}]."
+                    )
+                if normalized_state == "active" and state == "Active":
+                    return last_response
+            else:
+                if normalized_state == "empty":
+                    return last_response
+
+            time.sleep(delay_seconds)
+
         raise TimeoutError(
-            f"Timed out waiting for function [{function_arn}] to become Active "
-            f"under capacity provider [{capacity_provider_name}] after {max_attempts} attempts."
+            f"Timed out waiting for function [{function_arn}] to become {function_state} under capacity provider "
+            f"[{capacity_provider_name}] after {max_attempts} attempts."
         )
 
     def get_lambda_function(self, function_name):
@@ -1786,7 +1827,7 @@ class Zappa:
             response = self.lambda_client.create_function_url_config(
                 FunctionName=function_name, AuthType=function_url_config["authorizer"]
             )
-        print("function URL address: {}".format(response["FunctionUrl"]))
+        logger.info("function URL address: {}".format(response["FunctionUrl"]))
         self.update_function_url_policy(function_name, function_url_config)
         return response
 
@@ -1812,7 +1853,7 @@ class Zappa:
                         FunctionName=function_name,
                         AuthType=function_url_config["authorizer"],
                     )
-                print("function URL address: {}".format(response["FunctionUrl"]))
+                logger.info("function URL address: {}".format(response["FunctionUrl"]))
                 self.update_function_url_policy(config["FunctionArn"], function_url_config)
                 return response["FunctionUrl"]
         else:
@@ -1823,7 +1864,7 @@ class Zappa:
         for config in response.get("FunctionUrlConfigs", []):
             resp = self.lambda_client.delete_function_url_config(FunctionName=config["FunctionArn"])
             if resp["ResponseMetadata"]["HTTPStatusCode"] == 204:
-                print("function URL deleted: {}".format(config["FunctionUrl"]))
+                logger.info("function URL deleted: {}".format(config["FunctionUrl"]))
             self.delete_function_url_policy(config["FunctionArn"])
 
     ##
@@ -1832,7 +1873,7 @@ class Zappa:
     def update_lambda_function_url_domains(self, function_name, function_url_domains, certificate_arn, cloudfront_config):
         response = self.lambda_client.list_function_url_configs(FunctionName=function_name, MaxItems=50)
         if not response.get("FunctionUrlConfigs", []):
-            print("no function url configured on lambda, skip setting custom domains")
+            logger.info("no function url configured on lambda, skip setting custom domains")
         url = response["FunctionUrlConfigs"][0]["FunctionUrl"]
         import urllib
 
@@ -1933,7 +1974,7 @@ class Zappa:
         if not distributions:
             response = self.cloudfront_client.create_distribution(DistributionConfig=config)
             if response["ResponseMetadata"]["HTTPStatusCode"] == 201:
-                print(
+                logger.info(
                     "created cloudfront distribution for {}. It will take a while for the change to be deployed.".format(
                         function_url_domains
                     )
@@ -1951,7 +1992,7 @@ class Zappa:
                 DistributionConfig=new_config, Id=id, IfMatch=distribution["ETag"]
             )
             if response["ResponseMetadata"]["HTTPStatusCode"] == 200:
-                print(
+                logger.info(
                     "update cloudfront distribution for {}. It will take a while for the change to be deployed.".format(
                         function_url_domains
                     )
@@ -2714,7 +2755,7 @@ class Zappa:
 
         response = self.lambda_client.list_function_url_configs(FunctionName=lambda_name, MaxItems=50)
         if not response.get("FunctionUrlConfigs", []):
-            print("no function url configured on lambda. skip delete custom domains")
+            logger.info("no function url configured on lambda. skip delete custom domains")
         url = response["FunctionUrlConfigs"][0]["FunctionUrl"]
         url = urllib.parse.urlparse(url)
         distributions = self.cloudfront_client.list_distributions()
@@ -2734,12 +2775,12 @@ class Zappa:
                 DistributionConfig=new_config, Id=id, IfMatch=distribution["ETag"]
             )
             response
-            print("wait for distribution to be disabled.")
+            logger.info("wait for distribution to be disabled.")
             waiter = self.cloudfront_client.get_waiter("distribution_deployed")
             waiter.wait(Id=id, WaiterConfig={"Delay": 20, "MaxAttempts": 20})
             delete_response = self.cloudfront_client.delete_distribution(Id=id, IfMatch=response["ETag"])
             if delete_response["ResponseMetadata"]["HTTPStatusCode"] == 204:
-                print("cloudfront distribution deleted")
+                logger.info("cloudfront distribution deleted")
 
             # attempt remove 53 record
             for domain in distribution["Distribution"]["DistributionConfig"]["Aliases"].get("Items", []):
@@ -3199,7 +3240,7 @@ class Zappa:
         )
 
         if response["ResponseMetadata"]["HTTPStatusCode"] == 200:
-            print("removed route 53 record for {}".format(domain_name))
+            logger.info("removed route 53 record for {}".format(domain_name))
 
         return response
 
