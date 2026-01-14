@@ -1210,6 +1210,7 @@ class Zappa:
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         snap_start=None,
+        capacity_provider_config=None,
         xray_tracing=False,
         local_zip=None,
         use_alb=False,
@@ -1236,6 +1237,8 @@ class Zappa:
         if not layers:
             layers = []
 
+        uses_capacity_provider = bool(capacity_provider_config)
+
         kwargs = dict(
             FunctionName=function_name,
             Role=self.credentials_arn,
@@ -1255,6 +1258,8 @@ class Zappa:
             # zappa currently only supports a single architecture, and uses a str value internally
             Architectures=[self.architecture],
         )
+        if capacity_provider_config:
+            kwargs["CapacityProviderConfig"] = capacity_provider_config
         if not docker_image_uri:
             kwargs["Runtime"] = runtime
             kwargs["Handler"] = handler
@@ -1291,7 +1296,12 @@ class Zappa:
         if self.tags:
             self.lambda_client.tag_resource(Resource=resource_arn, Tags=self.tags)
 
-        if concurrency is not None:
+        if uses_capacity_provider:
+            if concurrency is not None:
+                logger.warning(
+                    "Reserved concurrency is not supported with Lambda capacity providers; skipping reserved concurrency."
+                )
+        elif concurrency is not None:
             self.lambda_client.put_function_concurrency(
                 FunctionName=resource_arn,
                 ReservedConcurrentExecutions=concurrency,
@@ -1311,6 +1321,7 @@ class Zappa:
         local_zip=None,
         num_revisions=None,
         concurrency=None,
+        capacity_provider_config=None,
         docker_image_uri=None,
     ):
         """
@@ -1357,13 +1368,27 @@ class Zappa:
                 Name=ALB_LAMBDA_ALIAS,
             )
 
-        if concurrency is not None:
-            self.lambda_client.put_function_concurrency(
-                FunctionName=function_name,
-                ReservedConcurrentExecutions=concurrency,
-            )
+        uses_capacity_provider = bool(capacity_provider_config)
+        if not uses_capacity_provider:
+            try:
+                function_configuration = self.lambda_client.get_function_configuration(FunctionName=function_name)
+                uses_capacity_provider = bool(function_configuration.get("CapacityProviderConfig"))
+            except botocore.exceptions.ClientError:
+                uses_capacity_provider = False
+
+        if uses_capacity_provider:
+            if concurrency is not None:
+                logger.warning(
+                    "Reserved concurrency is not supported with Lambda capacity providers; skipping reserved concurrency."
+                )
         else:
-            self.lambda_client.delete_function_concurrency(FunctionName=function_name)
+            if concurrency is not None:
+                self.lambda_client.put_function_concurrency(
+                    FunctionName=function_name,
+                    ReservedConcurrentExecutions=concurrency,
+                )
+            else:
+                self.lambda_client.delete_function_concurrency(FunctionName=function_name)
 
         if num_revisions:
             # Find the existing revision IDs for the given function
@@ -1404,6 +1429,7 @@ class Zappa:
         aws_kms_key_arn=None,
         layers=None,
         snap_start=None,
+        capacity_provider_config=None,
         wait=True,
     ):
         """
@@ -1452,6 +1478,9 @@ class Zappa:
             "TracingConfig": {"Mode": "Active" if self.xray_tracing else "PassThrough"},
             "SnapStart": {"ApplyOn": snap_start if snap_start else "None"},
         }
+
+        if capacity_provider_config:
+            kwargs["CapacityProviderConfig"] = capacity_provider_config
 
         if lambda_aws_config.get("PackageType", None) != "Image":
             kwargs.update(

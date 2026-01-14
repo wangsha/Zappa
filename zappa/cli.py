@@ -125,6 +125,7 @@ class ZappaCLI:
     xray_tracing = False
     aws_kms_key_arn = ""
     snap_start = None
+    capacity_provider_config = None
     context_header_mappings = None
     additional_text_mimetypes = None
     tags = []  # type: ignore[var-annotated]
@@ -913,6 +914,7 @@ class ZappaCLI:
                 runtime=self.runtime,
                 aws_environment_variables=self.aws_environment_variables,
                 aws_kms_key_arn=self.aws_kms_key_arn,
+                capacity_provider_config=self.capacity_provider_config,
                 use_alb=self.use_alb,
                 layers=self.layers,
                 concurrency=self.lambda_concurrency,
@@ -1151,6 +1153,7 @@ class ZappaCLI:
             function_name=self.lambda_name,
             num_revisions=self.num_retained_versions,
             concurrency=self.lambda_concurrency,
+            capacity_provider_config=self.capacity_provider_config,
         )
         if docker_image_uri:
             kwargs["docker_image_uri"] = docker_image_uri
@@ -1196,6 +1199,7 @@ class ZappaCLI:
             aws_kms_key_arn=self.aws_kms_key_arn,
             layers=self.layers,
             snap_start=self.snap_start,
+            capacity_provider_config=self.capacity_provider_config,
             wait=False,
         )
 
@@ -2679,6 +2683,7 @@ class ZappaCLI:
         self.runtime = self.stage_config.get("runtime", get_runtime_from_python_version())
         self.aws_kms_key_arn = self.stage_config.get("aws_kms_key_arn", "")
         self.snap_start = self.stage_config.get("snap_start", "None")
+        self.capacity_provider_config = self.stage_config.get("capacity_provider_config", None)
         self.context_header_mappings = self.stage_config.get("context_header_mappings", {})
         self.xray_tracing = self.stage_config.get("xray_tracing", False)
         self.desired_role_arn = self.stage_config.get("role_arn")

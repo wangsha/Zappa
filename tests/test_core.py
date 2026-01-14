@@ -868,6 +868,32 @@ class TestZappa(unittest.TestCase):
             z.update_lambda_configuration("test", "test", "test")
             self.assertEqual(mock_client.update_function_configuration.call_args[1]["Layers"], [])
 
+    def test_update_capacity_provider_configuration(self):
+        z = Zappa(load_credentials=False)
+        z.credentials_arn = object()
+        z.lambda_client = mock.MagicMock()
+        z.lambda_client.get_function_configuration.return_value = {"PackageType": "Zip"}
+        z.wait_until_lambda_function_is_updated = mock.MagicMock()
+        capacity_provider_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test",
+                "PerExecutionEnvironmentMaxConcurrency": 10,
+                "ExecutionEnvironmentMemoryGiBPerVCpu": 4.0,
+            }
+        }
+
+        z.update_lambda_configuration(
+            "test",
+            "test",
+            "test",
+            capacity_provider_config=capacity_provider_config,
+        )
+
+        self.assertEqual(
+            z.lambda_client.update_function_configuration.call_args[1]["CapacityProviderConfig"],
+            capacity_provider_config,
+        )
+
     def test_snap_start_configuration(self):
         """
         Test that SnapStart configuration is correctly set in Lambda configuration.
@@ -883,6 +909,22 @@ class TestZappa(unittest.TestCase):
         zappa_cli.api_stage = "snap_start_disabled"
         zappa_cli.load_settings("tests/test_settings.yaml")
         self.assertEqual("None", zappa_cli.snap_start)
+
+    def test_capacity_provider_configuration(self):
+        """
+        Test that capacity provider configuration is loaded from settings.
+        """
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "capacity_provider_enabled"
+        zappa_cli.load_settings("tests/test_settings.yaml")
+        expected_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test",
+                "PerExecutionEnvironmentMaxConcurrency": 5,
+                "ExecutionEnvironmentMemoryGiBPerVCpu": 2.0,
+            }
+        }
+        self.assertEqual(expected_config, zappa_cli.capacity_provider_config)
 
     def test_update_empty_aws_env_hash(self):
         z = Zappa()
@@ -3439,6 +3481,35 @@ class TestZappa(unittest.TestCase):
         elbv2_stubber.activate()
         zappa_core.undeploy_lambda_alb(**kwargs)
 
+    def test_create_lambda_capacity_provider_config(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.credentials_arn = "arn:aws:iam::123:role/zappa"
+        zappa_core.lambda_client = mock.MagicMock()
+        zappa_core.wait_until_lambda_function_is_active = mock.MagicMock()
+        zappa_core.lambda_client.create_function.return_value = {
+            "FunctionArn": "abc",
+            "Version": 1,
+        }
+        capacity_provider_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test",
+                "PerExecutionEnvironmentMaxConcurrency": 3,
+                "ExecutionEnvironmentMemoryGiBPerVCpu": 2.0,
+            }
+        }
+
+        zappa_core.create_lambda_function(
+            function_name="abc",
+            handler="handler.lambda_handler",
+            docker_image_uri="123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:latest",
+            capacity_provider_config=capacity_provider_config,
+        )
+
+        self.assertEqual(
+            zappa_core.lambda_client.create_function.call_args[1]["CapacityProviderConfig"],
+            capacity_provider_config,
+        )
+
     @mock.patch("botocore.client")
     def test_set_lambda_concurrency(self, client):
         boto_mock = mock.MagicMock()
@@ -3469,6 +3540,7 @@ class TestZappa(unittest.TestCase):
             aws_region="test",
             load_credentials=True,
         )
+        zappa_core.lambda_client.get_function_configuration.return_value = {}
         zappa_core.lambda_client.create_function.return_value = {
             "FunctionArn": "abc",
             "Version": 1,
@@ -3485,6 +3557,52 @@ class TestZappa(unittest.TestCase):
         boto_mock.client().delete_function_concurrency.assert_not_called()
 
     @mock.patch("botocore.client")
+    def test_update_lambda_concurrency_skipped_for_capacity_provider(self, client):
+        boto_mock = mock.MagicMock()
+        zappa_core = Zappa(
+            boto_session=boto_mock,
+            profile_name="test",
+            aws_region="test",
+            load_credentials=True,
+        )
+        zappa_core.lambda_client.create_function.return_value = {
+            "FunctionArn": "abc",
+            "Version": 1,
+        }
+        zappa_core.lambda_client.get_function_configuration.return_value = {"CapacityProviderConfig": {"foo": "bar"}}
+
+        zappa_core.update_lambda_function(bucket="test", function_name="abc")
+
+        boto_mock.client().put_function_concurrency.assert_not_called()
+        boto_mock.client().delete_function_concurrency.assert_not_called()
+
+    def test_create_lambda_capacity_provider_skips_concurrency(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.credentials_arn = "arn:aws:iam::123:role/zappa"
+        zappa_core.lambda_client = mock.MagicMock()
+        zappa_core.wait_until_lambda_function_is_active = mock.MagicMock()
+        zappa_core.lambda_client.create_function.return_value = {
+            "FunctionArn": "abc",
+            "Version": 1,
+        }
+        capacity_provider_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test",
+            }
+        }
+
+        zappa_core.create_lambda_function(
+            function_name="abc",
+            handler="handler.lambda_handler",
+            bucket="bucket",
+            s3_key="key",
+            capacity_provider_config=capacity_provider_config,
+            concurrency=5,
+        )
+
+        zappa_core.lambda_client.put_function_concurrency.assert_not_called()
+
+    @mock.patch("botocore.client")
     def test_delete_lambda_concurrency(self, client):
         boto_mock = mock.MagicMock()
         zappa_core = Zappa(
@@ -3493,6 +3611,7 @@ class TestZappa(unittest.TestCase):
             aws_region="test",
             load_credentials=True,
         )
+        zappa_core.lambda_client.get_function_configuration.return_value = {}
         zappa_core.lambda_client.create_function.return_value = {
             "FunctionArn": "abc",
             "Version": 1,
