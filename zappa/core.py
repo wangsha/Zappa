@@ -1677,7 +1677,7 @@ class Zappa:
         for attempt in range(1, max_attempts + 1):
             try:
                 response = self.lambda_client.list_function_versions_by_capacity_provider(**list_kwargs)
-                logger.info(f"Function Versions: {response}")
+                logger.info(json.dumps(response, indent=2))
                 last_response = response
             except botocore.exceptions.ClientError as e:
                 error_code = e.response.get("Error", {}).get("Code")
@@ -1710,7 +1710,7 @@ class Zappa:
                 )
                 last_response = page
 
-            logger.info(f"{attempt}/{max_attempts} attempts: {normalized_state=}, {matched_item=}")
+            logger.info(f"{attempt}/{max_attempts} attempts: {function_arn=} {normalized_state=}, {matched_item=}")
             if matched_item:
                 state = matched_item.get("State")
                 if state == "Failed":
