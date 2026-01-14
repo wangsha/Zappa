@@ -1413,6 +1413,7 @@ class Zappa:
         ephemeral_storage={"Size": 512},
         publish=True,
         vpc_config=None,
+        efs_config=None,
         runtime="python3.13",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
