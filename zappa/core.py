@@ -1414,17 +1414,11 @@ class Zappa:
         if num_revisions:
             # Find the existing revision IDs for the given function
             # Related: https://github.com/Miserlou/Zappa/issues/1402
-            versions_in_lambda = []
-            versions = self.lambda_client.list_versions_by_function(FunctionName=function_name)
-            for version in versions["Versions"]:
-                versions_in_lambda.append(version["Version"])
-            while "NextMarker" in versions:
-                versions = self.lambda_client.list_versions_by_function(
-                    FunctionName=function_name, Marker=versions["NextMarker"]
-                )
-                for version in versions["Versions"]:
-                    versions_in_lambda.append(version["Version"])
+            versions_in_lambda = self.list_lambda_function_versions(function_name)
             versions_in_lambda.remove("$LATEST")
+
+            if "$LATEST.PUBLISHED" in versions_in_lambda:
+                versions_in_lambda.remove("$LATEST.PUBLISHED")
             # Delete older revisions if their number exceeds the specified limit
             for version in versions_in_lambda[::-1][num_revisions:]:
                 self.lambda_client.delete_function(FunctionName=function_name, Qualifier=version)
@@ -1432,6 +1426,19 @@ class Zappa:
         self.wait_until_lambda_function_is_updated(function_name)
 
         return resource_arn
+
+    def list_lambda_function_versions(self, function_name):
+        versions_in_lambda = []
+        versions = self.lambda_client.list_versions_by_function(FunctionName=function_name)
+        for version in versions["Versions"]:
+            versions_in_lambda.append(version["Version"])
+        while "NextMarker" in versions:
+            versions = self.lambda_client.list_versions_by_function(
+                    FunctionName=function_name, Marker=versions["NextMarker"]
+                )
+            for version in versions["Versions"]:
+                versions_in_lambda.append(version["Version"])
+        return versions_in_lambda
 
     def update_lambda_configuration(
         self,
@@ -1527,8 +1534,7 @@ class Zappa:
 
         resource_arn = response["FunctionArn"]
         if capacity_provider_config:
-            
-            # wait for function to be active, otherwise update function url settings will fail
+
             capacity_provider_arn = capacity_provider_config["LambdaManagedInstancesCapacityProviderConfig"][
                 "CapacityProviderArn"
             ]
@@ -1538,19 +1544,21 @@ class Zappa:
             elif "capacity-provider:" in capacity_provider_name_part:
                 capacity_provider_name_part = capacity_provider_name_part.split("capacity-provider:", 1)[1]
             capacity_provider_name = capacity_provider_name_part.rsplit("/", 1)[-1]
+            # wait for latest version
+            versions_in_lambda = self.list_lambda_function_versions(function_name=function_name)
+            latest_version = max(int(v) for v in versions_in_lambda if v.isdigit())
+
             self.wait_for_capacity_provider_response(
                 capacity_provider_name=capacity_provider_name,
-                function_arn=response["FunctionArn"],
+                function_arn=f"{response["FunctionArn"]}:{latest_version}",
                 function_state="Active",
             )
-            # if latest version exists, wait to be deleted
-            self.wait_for_capacity_provider_response(
-                capacity_provider_name=capacity_provider_name,
-                function_arn=f"{response["FunctionArn"]}:$LATEST.PUBLISHED",
-                function_state="Empty",
-            )
+      
             # publish to latest
             response = self.lambda_client.publish_version(FunctionName=function_name, PublishTo='LATEST_PUBLISHED')
+            logger.info(f"Publish to {response['FunctionArn']}")
+
+            time.sleep(10)
             self.wait_for_capacity_provider_response(
                 capacity_provider_name=capacity_provider_name,
                 function_arn=response["FunctionArn"],
@@ -1673,11 +1681,12 @@ class Zappa:
         if marker:
             list_kwargs["Marker"] = marker
 
+
+        logger.info(f"Wait for {function_arn} to be {function_state} ...")
         last_response = None
         for attempt in range(1, max_attempts + 1):
             try:
                 response = self.lambda_client.list_function_versions_by_capacity_provider(**list_kwargs)
-                logger.info(json.dumps(response, indent=2))
                 last_response = response
             except botocore.exceptions.ClientError as e:
                 error_code = e.response.get("Error", {}).get("Code")
@@ -1710,7 +1719,7 @@ class Zappa:
                 )
                 last_response = page
 
-            logger.info(f"{attempt}/{max_attempts} attempts: {function_arn=} {normalized_state=}, {matched_item=}")
+            logger.info(f"{attempt}/{max_attempts} attempts: current state {matched_item.get("State")}, expect {function_state}")
             if matched_item:
                 state = matched_item.get("State")
                 if state == "Failed":
@@ -1718,7 +1727,7 @@ class Zappa:
                         f"Function version [{matched_item.get('FunctionArn')}] entered Failed state under "
                         f"capacity provider [{capacity_provider_name}]."
                     )
-                if normalized_state == "active" and state == "Active":
+                if normalized_state == "active" and state == 'Active':
                     return last_response
             else:
                 if normalized_state == "empty":
