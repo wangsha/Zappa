@@ -1216,6 +1216,7 @@ class Zappa:
         ephemeral_storage={"Size": 512},
         publish=True,
         vpc_config=None,
+        efs_config=None,
         dead_letter_config=None,
         runtime="python3.13",
         aws_environment_variables=None,
@@ -1280,6 +1281,7 @@ class Zappa:
         )
         if capacity_provider_config:
             kwargs["CapacityProviderConfig"] = capacity_provider_config
+            kwargs.pop("VpcConfig")
         if not docker_image_uri:
             kwargs["Runtime"] = runtime
             kwargs["Handler"] = handler
@@ -1719,9 +1721,9 @@ class Zappa:
                 )
                 last_response = page
 
-            logger.info(f"{attempt}/{max_attempts} attempts: current state {matched_item.get("State")}, expect {function_state}")
             if matched_item:
                 state = matched_item.get("State")
+                logger.info(f"{attempt}/{max_attempts} attempts: current state {state}, expect {function_state}")
                 if state == "Failed":
                     raise RuntimeError(
                         f"Function version [{matched_item.get('FunctionArn')}] entered Failed state under "
