@@ -324,6 +324,7 @@ class Zappa:
             self.dynamodb_client = self.boto_client("dynamodb")
             self.cognito_client = self.boto_client("cognito-idp")
             self.sts_client = self.boto_client("sts")
+            self.cloudfront_client = self.boto_client("cloudfront")
 
         self.tags = tags
         self.cf_template = troposphere.Template()
