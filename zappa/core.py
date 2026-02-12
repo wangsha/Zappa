@@ -2,6 +2,7 @@
 Zappa core library. You may also want to look at `cli.py` and `util.py`.
 """
 
+import datetime
 import getpass
 import hashlib
 import json
@@ -16,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib
 import uuid
 import zipfile
 from builtins import bytes, int
@@ -162,7 +164,7 @@ def build_manylinux_wheel_file_match_pattern(runtime: str, architecture: str) ->
     # Support PEP600 (https://peps.python.org/pep-0600/)
     # The wheel filename is {distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl
     runtime_major_version, runtime_minor_version = runtime[6:].split(".")
-    python_tag = f"cp{runtime_major_version}{runtime_minor_version}"  # python3.13 -> cp313
+    python_tag = f"cp{runtime_major_version}{runtime_minor_version}"  # python3.14 -> cp314
     manylinux_legacy_tags = ("manylinux2014", "manylinux2010", "manylinux1")
     if architecture == X86_ARCHITECTURE:
         valid_platform_tags = [X86_ARCHITECTURE]
@@ -245,7 +247,7 @@ class Zappa:
         load_credentials=True,
         desired_role_name=None,
         desired_role_arn=None,
-        runtime="python3.13",  # Detected at runtime in CLI
+        runtime="python3.14",  # Detected at runtime in CLI
         tags=(),
         endpoint_urls={},
         xray_tracing=False,
@@ -268,6 +270,9 @@ class Zappa:
 
         if desired_role_arn:
             self.credentials_arn = desired_role_arn
+
+        if architecture:
+            self.architecture = architecture
 
         self.runtime = runtime
 
@@ -319,7 +324,7 @@ class Zappa:
             self.dynamodb_client = self.boto_client("dynamodb")
             self.cognito_client = self.boto_client("cognito-idp")
             self.sts_client = self.boto_client("sts")
-            self.efs_client = self.boto_client("efs")
+            self.cloudfront_client = self.boto_client("cloudfront")
 
         self.tags = tags
         self.cf_template = troposphere.Template()
@@ -396,7 +401,10 @@ class Zappa:
                 for (
                     requirement_package_name
                 ) in distribution_package.requires:  # Generated requirements specified for this Distribution
-                    deps += self.get_deps_list(pkg_name=requirement_package_name, installed_distros=installed_distros)
+                    deps += self.get_deps_list(
+                        pkg_name=requirement_package_name,
+                        installed_distros=installed_distros,
+                    )
         return list(set(deps))  # de-dupe before returning
 
     def create_handler_venv(self, use_zappa_release: Optional[str] = None):
@@ -658,7 +666,12 @@ class Zappa:
                     ignore=shutil.ignore_patterns(*excludes),
                 )
             else:
-                copytree(site_packages_64.resolve(), temp_package_path.resolve(), metadata=False, symlinks=False)
+                copytree(
+                    site_packages_64.resolve(),
+                    temp_package_path.resolve(),
+                    metadata=False,
+                    symlinks=False,
+                )
 
         if egg_links:
             self.copy_editable_packages(egg_links, temp_package_path)
@@ -1204,18 +1217,20 @@ class Zappa:
         ephemeral_storage={"Size": 512},
         publish=True,
         vpc_config=None,
-        dead_letter_config=None,
         efs_config=None,
+        dead_letter_config=None,
         runtime="python3.13",
         aws_environment_variables=None,
         aws_kms_key_arn=None,
         snap_start=None,
+        capacity_provider_config=None,
         xray_tracing=False,
         local_zip=None,
         use_alb=False,
         layers=None,
         concurrency=None,
         docker_image_uri=None,
+        architecture=None,
     ):
         """
         Given a bucket and key (or a local path) of a valid Lambda-zip,
@@ -1235,6 +1250,16 @@ class Zappa:
             aws_kms_key_arn = ""
         if not layers:
             layers = []
+        if not architecture:
+            self.architecture = "x86_64"
+
+        uses_capacity_provider = bool(capacity_provider_config)
+        uses_vpc = bool(vpc_config and (vpc_config.get("SubnetIds") or vpc_config.get("SecurityGroupIds")))
+        if uses_capacity_provider and uses_vpc:
+            raise ValueError(
+                "Lambda capacity providers cannot be used with VPC configurations. "
+                "Remove VPC settings or disable the capacity provider."
+            )
 
         kwargs = dict(
             FunctionName=function_name,
@@ -1255,6 +1280,9 @@ class Zappa:
             # zappa currently only supports a single architecture, and uses a str value internally
             Architectures=[self.architecture],
         )
+        if capacity_provider_config:
+            kwargs["CapacityProviderConfig"] = capacity_provider_config
+            kwargs.pop("VpcConfig")
         if not docker_image_uri:
             kwargs["Runtime"] = runtime
             kwargs["Handler"] = handler
@@ -1291,7 +1319,12 @@ class Zappa:
         if self.tags:
             self.lambda_client.tag_resource(Resource=resource_arn, Tags=self.tags)
 
-        if concurrency is not None:
+        if uses_capacity_provider:
+            if concurrency is not None:
+                logger.warning(
+                    "Reserved concurrency is not supported with Lambda capacity providers; skipping reserved concurrency."
+                )
+        elif concurrency is not None:
             self.lambda_client.put_function_concurrency(
                 FunctionName=resource_arn,
                 ReservedConcurrentExecutions=concurrency,
@@ -1311,7 +1344,9 @@ class Zappa:
         local_zip=None,
         num_revisions=None,
         concurrency=None,
+        capacity_provider_config=None,
         docker_image_uri=None,
+        architecture=None,
     ):
         """
         Given a bucket and key (or a local path) of a valid Lambda-zip,
@@ -1320,7 +1355,7 @@ class Zappa:
         """
         logger.info("Updating Lambda function code..")
 
-        kwargs = dict(FunctionName=function_name, Publish=publish)
+        kwargs = dict(FunctionName=function_name, Publish=publish, Architectures=[architecture])
         if docker_image_uri:
             kwargs["ImageUri"] = docker_image_uri
         elif local_zip:
@@ -1357,28 +1392,36 @@ class Zappa:
                 Name=ALB_LAMBDA_ALIAS,
             )
 
-        if concurrency is not None:
-            self.lambda_client.put_function_concurrency(
-                FunctionName=function_name,
-                ReservedConcurrentExecutions=concurrency,
-            )
+        uses_capacity_provider = bool(capacity_provider_config)
+        if not uses_capacity_provider:
+            try:
+                function_configuration = self.lambda_client.get_function_configuration(FunctionName=function_name)
+                uses_capacity_provider = bool(function_configuration.get("CapacityProviderConfig"))
+            except botocore.exceptions.ClientError:
+                uses_capacity_provider = False
+
+        if uses_capacity_provider:
+            if concurrency is not None:
+                logger.warning(
+                    "Reserved concurrency is not supported with Lambda capacity providers; skipping reserved concurrency."
+                )
         else:
-            self.lambda_client.delete_function_concurrency(FunctionName=function_name)
+            if concurrency is not None:
+                self.lambda_client.put_function_concurrency(
+                    FunctionName=function_name,
+                    ReservedConcurrentExecutions=concurrency,
+                )
+            else:
+                self.lambda_client.delete_function_concurrency(FunctionName=function_name)
 
         if num_revisions:
             # Find the existing revision IDs for the given function
             # Related: https://github.com/Miserlou/Zappa/issues/1402
-            versions_in_lambda = []
-            versions = self.lambda_client.list_versions_by_function(FunctionName=function_name)
-            for version in versions["Versions"]:
-                versions_in_lambda.append(version["Version"])
-            while "NextMarker" in versions:
-                versions = self.lambda_client.list_versions_by_function(
-                    FunctionName=function_name, Marker=versions["NextMarker"]
-                )
-                for version in versions["Versions"]:
-                    versions_in_lambda.append(version["Version"])
+            versions_in_lambda = self.list_lambda_function_versions(function_name)
             versions_in_lambda.remove("$LATEST")
+
+            if "$LATEST.PUBLISHED" in versions_in_lambda:
+                versions_in_lambda.remove("$LATEST.PUBLISHED")
             # Delete older revisions if their number exceeds the specified limit
             for version in versions_in_lambda[::-1][num_revisions:]:
                 self.lambda_client.delete_function(FunctionName=function_name, Qualifier=version)
@@ -1386,6 +1429,19 @@ class Zappa:
         self.wait_until_lambda_function_is_updated(function_name)
 
         return resource_arn
+
+    def list_lambda_function_versions(self, function_name):
+        versions_in_lambda = []
+        versions = self.lambda_client.list_versions_by_function(FunctionName=function_name)
+        for version in versions["Versions"]:
+            versions_in_lambda.append(version["Version"])
+        while "NextMarker" in versions:
+            versions = self.lambda_client.list_versions_by_function(
+                    FunctionName=function_name, Marker=versions["NextMarker"]
+                )
+            for version in versions["Versions"]:
+                versions_in_lambda.append(version["Version"])
+        return versions_in_lambda
 
     def update_lambda_configuration(
         self,
@@ -1404,11 +1460,14 @@ class Zappa:
         aws_kms_key_arn=None,
         layers=None,
         snap_start=None,
+        capacity_provider_config=None,
         wait=True,
+        architecture=None,
     ):
         """
         Given an existing function ARN, update the configuration variables.
         """
+
         logger.info("Updating Lambda function configuration..")
 
         if not vpc_config:
@@ -1423,6 +1482,14 @@ class Zappa:
             aws_environment_variables = {}
         if not layers:
             layers = []
+
+        uses_capacity_provider = bool(capacity_provider_config)
+        uses_vpc = bool(vpc_config and (vpc_config.get("SubnetIds") or vpc_config.get("SecurityGroupIds")))
+        if uses_capacity_provider and uses_vpc:
+            raise ValueError(
+                "Lambda capacity providers cannot be used with VPC configurations. "
+                "Remove VPC settings or disable the capacity provider."
+            )
 
         if wait:
             # Wait until function is ready, otherwise expected keys will be missing from 'lambda_aws_config'.
@@ -1453,6 +1520,10 @@ class Zappa:
             "SnapStart": {"ApplyOn": snap_start if snap_start else "None"},
         }
 
+        if capacity_provider_config:
+            kwargs["CapacityProviderConfig"] = capacity_provider_config
+            kwargs.pop("VpcConfig")
+
         if lambda_aws_config.get("PackageType", None) != "Image":
             kwargs.update(
                 {
@@ -1465,6 +1536,37 @@ class Zappa:
         response = self.lambda_client.update_function_configuration(**kwargs)
 
         resource_arn = response["FunctionArn"]
+        if capacity_provider_config:
+
+            capacity_provider_arn = capacity_provider_config["LambdaManagedInstancesCapacityProviderConfig"][
+                "CapacityProviderArn"
+            ]
+            capacity_provider_name_part = capacity_provider_arn
+            if "capacity-provider/" in capacity_provider_name_part:
+                capacity_provider_name_part = capacity_provider_name_part.split("capacity-provider/", 1)[1]
+            elif "capacity-provider:" in capacity_provider_name_part:
+                capacity_provider_name_part = capacity_provider_name_part.split("capacity-provider:", 1)[1]
+            capacity_provider_name = capacity_provider_name_part.rsplit("/", 1)[-1]
+            # wait for latest version
+            versions_in_lambda = self.list_lambda_function_versions(function_name=function_name)
+            latest_version = max(int(v) for v in versions_in_lambda if v.isdigit())
+
+            self.wait_for_capacity_provider_response(
+                capacity_provider_name=capacity_provider_name,
+                function_arn=f"{response["FunctionArn"]}:{latest_version}",
+                function_state="Active",
+            )
+      
+            # publish to latest
+            response = self.lambda_client.publish_version(FunctionName=function_name, PublishTo='LATEST_PUBLISHED')
+            logger.info(f"Publish to {response['FunctionArn']}")
+
+            time.sleep(10)
+            self.wait_for_capacity_provider_response(
+                capacity_provider_name=capacity_provider_name,
+                function_arn=response["FunctionArn"],
+                function_state="Active",
+            )
 
         if self.tags:
             self.lambda_client.tag_resource(Resource=resource_arn, Tags=self.tags)
@@ -1552,6 +1654,94 @@ class Zappa:
         waiter = self.lambda_client.get_waiter("function_updated")
         logger.info(f"Waiting for lambda function [{function_name}] to be updated...")
         waiter.wait(FunctionName=function_name)
+
+    def wait_for_capacity_provider_response(
+        self,
+        function_arn: str,
+        capacity_provider_name: str,
+        function_state: str = "Active",
+        marker: str | None = None,
+        max_attempts: int = 60,
+        delay_seconds: float = 5,
+    ):
+        """
+        Call list_function_versions_by_capacity_provider with retry.
+
+        If function_arn is provided:
+        - function_state="Active": poll until the matching FunctionVersion has State=Active
+        - function_state="Empty": poll until the matching FunctionVersion record is no longer returned
+        In both modes, if the matching record is ever seen in State=Failed, raises RuntimeError.
+        Returns the last API response seen.
+        """
+        if not capacity_provider_name:
+            raise ValueError("capacity_provider_name is required.")
+
+        normalized_state = (function_state or "").strip().lower()
+        if normalized_state not in ("active", "empty"):
+            raise ValueError("function_state must be 'Active' or 'Empty'.")
+
+        list_kwargs = {"CapacityProviderName": capacity_provider_name}
+        if marker:
+            list_kwargs["Marker"] = marker
+
+
+        logger.info(f"Wait for {function_arn} to be {function_state} ...")
+        last_response = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self.lambda_client.list_function_versions_by_capacity_provider(**list_kwargs)
+                last_response = response
+            except botocore.exceptions.ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code")
+                if error_code in ("ThrottlingException", "Throttling", "TooManyRequestsException") and attempt < max_attempts:
+                    time.sleep(delay_seconds)
+                    continue
+                raise
+
+            if not function_arn:
+                return response
+
+            matched_item = None
+            page = response or {}
+            while True:
+                for item in (page.get("FunctionVersions") or []):
+                    arn = item.get("FunctionArn") or ""
+                    if function_arn in arn:
+                        matched_item = item
+                        break
+                if matched_item:
+                    break
+
+                next_marker = page.get("NextMarker")
+                if not next_marker:
+                    break
+
+                page = self.lambda_client.list_function_versions_by_capacity_provider(
+                    CapacityProviderName=capacity_provider_name,
+                    Marker=next_marker,
+                )
+                last_response = page
+
+            if matched_item:
+                state = matched_item.get("State")
+                logger.info(f"{attempt}/{max_attempts} attempts: current state {state}, expect {function_state}")
+                if state == "Failed":
+                    raise RuntimeError(
+                        f"Function version [{matched_item.get('FunctionArn')}] entered Failed state under "
+                        f"capacity provider [{capacity_provider_name}]."
+                    )
+                if normalized_state == "active" and state == 'Active':
+                    return last_response
+            else:
+                if normalized_state == "empty":
+                    return last_response
+
+            time.sleep(delay_seconds)
+
+        raise TimeoutError(
+            f"Timed out waiting for function [{function_arn}] to become {function_state} under capacity provider "
+            f"[{capacity_provider_name}] after {max_attempts} attempts."
+        )
 
     def get_lambda_function(self, function_name):
         """
@@ -1649,7 +1839,7 @@ class Zappa:
             response = self.lambda_client.create_function_url_config(
                 FunctionName=function_name, AuthType=function_url_config["authorizer"]
             )
-        print("function URL address: {}".format(response["FunctionUrl"]))
+        logger.info("function URL address: {}".format(response["FunctionUrl"]))
         self.update_function_url_policy(function_name, function_url_config)
         return response
 
@@ -1672,19 +1862,21 @@ class Zappa:
                     )
                 else:
                     response = self.lambda_client.update_function_url_config(
-                        FunctionName=function_name, AuthType=function_url_config["authorizer"]
+                        FunctionName=function_name,
+                        AuthType=function_url_config["authorizer"],
                     )
-                print("function URL address: {}".format(response["FunctionUrl"]))
+                logger.info("function URL address: {}".format(response["FunctionUrl"]))
                 self.update_function_url_policy(config["FunctionArn"], function_url_config)
+                return response["FunctionUrl"]
         else:
-            self.deploy_lambda_function_url(function_name, function_url_config)
+            return self.deploy_lambda_function_url(function_name, function_url_config)
 
     def delete_lambda_function_url(self, function_name):
         response = self.lambda_client.list_function_url_configs(FunctionName=function_name, MaxItems=50)
         for config in response.get("FunctionUrlConfigs", []):
             resp = self.lambda_client.delete_function_url_config(FunctionName=config["FunctionArn"])
             if resp["ResponseMetadata"]["HTTPStatusCode"] == 204:
-                print("function URL deleted: {}".format(config["FunctionUrl"]))
+                logger.info("function URL deleted: {}".format(config["FunctionUrl"]))
             self.delete_function_url_policy(config["FunctionArn"])
 
     ##
@@ -1693,7 +1885,7 @@ class Zappa:
     def update_lambda_function_url_domains(self, function_name, function_url_domains, certificate_arn, cloudfront_config):
         response = self.lambda_client.list_function_url_configs(FunctionName=function_name, MaxItems=50)
         if not response.get("FunctionUrlConfigs", []):
-            print("no function url configured on lambda, skip setting custom domains")
+            logger.info("no function url configured on lambda, skip setting custom domains")
         url = response["FunctionUrlConfigs"][0]["FunctionUrl"]
         import urllib
 
@@ -1703,7 +1895,10 @@ class Zappa:
 
         config = {
             "CallerReference": "zappa-create-function-url-custom-domain-" + function_name.split(":")[-1],
-            "Aliases": {"Quantity": len(function_url_domains), "Items": function_url_domains},
+            "Aliases": {
+                "Quantity": len(function_url_domains),
+                "Items": function_url_domains,
+            },
             "DefaultRootObject": "",
             "Enabled": True,
             "PriceClass": "PriceClass_100",
@@ -1719,7 +1914,10 @@ class Zappa:
                         "CustomHeaders": {
                             "Quantity": 1,
                             "Items": [
-                                {"HeaderName": "CloudFront", "HeaderValue": "CloudFront"},
+                                {
+                                    "HeaderName": "CloudFront",
+                                    "HeaderValue": "CloudFront",
+                                },
                             ],
                         },
                         "CustomOriginConfig": {
@@ -1744,13 +1942,29 @@ class Zappa:
                 "FieldLevelEncryptionId": "",
                 "AllowedMethods": {
                     "Quantity": 7,
-                    "Items": ["HEAD", "DELETE", "POST", "GET", "OPTIONS", "PUT", "PATCH"],
-                    "CachedMethods": {"Quantity": 3, "Items": ["HEAD", "GET", "OPTIONS"]},
+                    "Items": [
+                        "HEAD",
+                        "DELETE",
+                        "POST",
+                        "GET",
+                        "OPTIONS",
+                        "PUT",
+                        "PATCH",
+                    ],
+                    "CachedMethods": {
+                        "Quantity": 3,
+                        "Items": ["HEAD", "GET", "OPTIONS"],
+                    },
                 },
                 "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",  # noqa: E501 https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
                 "OriginRequestPolicyId": "b689b0a8-53d0-40ab-baf2-68738e2966ac",  # noqa: E501 https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html#managed-origin-request-policy-all-viewer-except-host-header
             },
-            "Logging": {"Enabled": False, "IncludeCookies": False, "Bucket": "", "Prefix": ""},
+            "Logging": {
+                "Enabled": False,
+                "IncludeCookies": False,
+                "Bucket": "",
+                "Prefix": "",
+            },
             "Restrictions": {"GeoRestriction": {"RestrictionType": "none", **NULL_CONFIG}},
             "WebACLId": "",
         }
@@ -1772,7 +1986,7 @@ class Zappa:
         if not distributions:
             response = self.cloudfront_client.create_distribution(DistributionConfig=config)
             if response["ResponseMetadata"]["HTTPStatusCode"] == 201:
-                print(
+                logger.info(
                     "created cloudfront distribution for {}. It will take a while for the change to be deployed.".format(
                         function_url_domains
                     )
@@ -1782,13 +1996,15 @@ class Zappa:
             id = distributions[0]["Id"]
             distribution = self.cloudfront_client.get_distribution(Id=id)
             new_config = distribution["Distribution"]["DistributionConfig"]
-            new_config.update(config)
+            updates = config.copy()
+            updates.pop("CallerReference")
+            new_config.update(updates)
 
             response = self.cloudfront_client.update_distribution(
                 DistributionConfig=new_config, Id=id, IfMatch=distribution["ETag"]
             )
             if response["ResponseMetadata"]["HTTPStatusCode"] == 200:
-                print(
+                logger.info(
                     "update cloudfront distribution for {}. It will take a while for the change to be deployed.".format(
                         function_url_domains
                     )
@@ -2547,6 +2763,41 @@ class Zappa:
                 continue
             yield api
 
+    def undeploy_function_url_custom_domain(self, lambda_name, domains=None):
+
+        response = self.lambda_client.list_function_url_configs(FunctionName=lambda_name, MaxItems=50)
+        if not response.get("FunctionUrlConfigs", []):
+            logger.info("no function url configured on lambda. skip delete custom domains")
+        url = response["FunctionUrlConfigs"][0]["FunctionUrl"]
+        url = urllib.parse.urlparse(url)
+        distributions = self.cloudfront_client.list_distributions()
+        distributions = [
+            item
+            for item in distributions["DistributionList"]["Items"]
+            if url.hostname in [origin["DomainName"] for origin in item["Origins"]["Items"]]
+        ]
+
+        for distribution in distributions:
+            id = distribution["Id"]
+            distribution = self.cloudfront_client.get_distribution(Id=id)
+            new_config = distribution["Distribution"]["DistributionConfig"]
+            new_config["Enabled"] = False
+
+            response = self.cloudfront_client.update_distribution(
+                DistributionConfig=new_config, Id=id, IfMatch=distribution["ETag"]
+            )
+            response
+            logger.info("wait for distribution to be disabled.")
+            waiter = self.cloudfront_client.get_waiter("distribution_deployed")
+            waiter.wait(Id=id, WaiterConfig={"Delay": 20, "MaxAttempts": 20})
+            delete_response = self.cloudfront_client.delete_distribution(Id=id, IfMatch=response["ETag"])
+            if delete_response["ResponseMetadata"]["HTTPStatusCode"] == 204:
+                logger.info("cloudfront distribution deleted")
+
+            # attempt remove 53 record
+            for domain in distribution["Distribution"]["DistributionConfig"]["Aliases"].get("Items", []):
+                self.delete_route53_records(domain, distribution["Distribution"]["DomainName"])
+
     def undeploy_api_gateway(self, lambda_name, domain_name=None, base_path=None):
         """
         Delete a deployed REST API Gateway.
@@ -2879,7 +3130,8 @@ class Zappa:
                     if item["name"] == lambda_name:
                         return item["id"]
 
-                logger.exception("Could not get API ID.")
+                logger.exception(f"Could not get API ID. {lambda_name} {self.boto_session.region_name}")
+                logger.exception(response)
                 return None
             except Exception:  # pragma: no cover
                 # We don't even have an API deployed. That's okay!
@@ -2917,17 +3169,19 @@ class Zappa:
                 certificateName=certificate_name,
                 certificateArn=certificate_arn,
             )
+            api_id = self.get_api_id(lambda_name)
+            if not api_id:
+                raise LookupError("No API URL to certify found - did you deploy?")
 
-        api_id = self.get_api_id(lambda_name)
-        if not api_id:
-            raise LookupError("No API URL to certify found - did you deploy?")
+            self.apigateway_client.create_base_path_mapping(
+                domainName=domain_name,
+                basePath="" if base_path is None else base_path,
+                restApiId=api_id,
+                stage=stage,
+            )
 
-        self.apigateway_client.create_base_path_mapping(
-            domainName=domain_name,
-            basePath="" if base_path is None else base_path,
-            restApiId=api_id,
-            stage=stage,
-        )
+        if self.function_url_enabled:
+            pass
 
         return agw_response["distributionDomainName"]
 
@@ -2959,15 +3213,46 @@ class Zappa:
         # Related: https://github.com/boto/boto3/issues/157
         # and: http://docs.aws.amazon.com/Route53/latest/APIReference/CreateAliasRRSAPI.html
         # and policy: https://spin.atomicobject.com/2016/04/28/route-53-hosted-zone-managment/
-        # pure_zone_id = zone_id.split('/hostedzone/')[1]
 
-        # XXX: ClientError: An error occurred (InvalidChangeBatch) when calling the ChangeResourceRecordSets operation:
-        # Tried to create an alias that targets d1awfeji80d0k2.cloudfront.net., type A in zone Z1XWOQP59BYF6Z,
-        # but the alias target name does not lie within the target zone
         response = self.route53.change_resource_record_sets(
             HostedZoneId=zone_id,
             ChangeBatch={"Changes": [{"Action": "UPSERT", "ResourceRecordSet": record_set}]},
         )
+
+        return response
+
+    def delete_route53_records(self, domain_name, dns_name):
+        """
+        Updates Route53 Records following GW domain creation
+        """
+        zone_id = self.get_hosted_zone_id_for_domain(domain_name)
+
+        is_apex = self.route53.get_hosted_zone(Id=zone_id)["HostedZone"]["Name"][:-1] == domain_name
+        if is_apex:
+            record_set = {
+                "Name": domain_name,
+                "Type": "A",
+                "AliasTarget": {
+                    "HostedZoneId": "Z2FDTNDATAQYW2",  # This is a magic value that means "CloudFront"
+                    "DNSName": dns_name,
+                    "EvaluateTargetHealth": False,
+                },
+            }
+        else:
+            record_set = {
+                "Name": domain_name,
+                "Type": "CNAME",
+                "ResourceRecords": [{"Value": dns_name}],
+                "TTL": 60,
+            }
+
+        response = self.route53.change_resource_record_sets(
+            HostedZoneId=zone_id,
+            ChangeBatch={"Changes": [{"Action": "DELETE", "ResourceRecordSet": record_set}]},
+        )
+
+        if response["ResponseMetadata"]["HTTPStatusCode"] == 200:
+            logger.info("removed route 53 record for {}".format(domain_name))
 
         return response
 
@@ -2983,6 +3268,8 @@ class Zappa:
         stage=None,
         route53=True,
         base_path=None,
+        use_apigateway=True,
+        use_function_url=False,
     ):
         """
         This updates your certificate information for an existing domain,
@@ -3009,19 +3296,27 @@ class Zappa:
             )
             certificate_arn = acm_certificate["CertificateArn"]
 
-        self.update_domain_base_path_mapping(domain_name, lambda_name, stage, base_path)
+        if use_apigateway:
+            self.update_domain_base_path_mapping(domain_name, lambda_name, stage, base_path)
 
-        return self.apigateway_client.update_domain_name(
-            domainName=domain_name,
-            patchOperations=[
-                {
-                    "op": "replace",
-                    "path": "/certificateName",
-                    "value": certificate_name,
-                },
-                {"op": "replace", "path": "/certificateArn", "value": certificate_arn},
-            ],
-        )
+            res = self.apigateway_client.update_domain_name(
+                domainName=domain_name,
+                patchOperations=[
+                    {
+                        "op": "replace",
+                        "path": "/certificateName",
+                        "value": certificate_name,
+                    },
+                    {
+                        "op": "replace",
+                        "path": "/certificateArn",
+                        "value": certificate_arn,
+                    },
+                ],
+            )
+        if use_function_url:
+            pass
+        return res
 
     def update_domain_base_path_mapping(self, domain_name, lambda_name, stage, base_path):
         """
@@ -3169,12 +3464,11 @@ class Zappa:
             if policy_response["ResponseMetadata"]["HTTPStatusCode"] == 200:
                 statement = json.loads(policy_response["Policy"])["Statement"]
                 for s in statement:
-                    # Only remove CloudWatch Events permissions (created by schedule_events)
-                    principal = s.get("Principal", {})
-                    if isinstance(principal, dict) and principal.get("Service") == "events.amazonaws.com":
-                        delete_response = self.lambda_client.remove_permission(FunctionName=lambda_name, StatementId=s["Sid"])
-                        if delete_response["ResponseMetadata"]["HTTPStatusCode"] != 204:
-                            logger.error("Failed to delete an obsolete policy statement: {}".format(policy_response))
+                    if s["Sid"] in ["FunctionURLAllowPublicAccess"]:
+                        continue
+                    delete_response = self.lambda_client.remove_permission(FunctionName=lambda_name, StatementId=s["Sid"])
+                    if delete_response["ResponseMetadata"]["HTTPStatusCode"] != 204:
+                        logger.error("Failed to delete an obsolete policy statement: {}".format(policy_response))
             else:
                 logger.debug("Failed to load Lambda function policy: {}".format(policy_response))
         except ClientError as e:
@@ -3198,7 +3492,7 @@ class Zappa:
 
         permission_response = self.lambda_client.add_permission(
             FunctionName=lambda_name,
-            StatementId="".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8)),
+            StatementId="zappa-" + "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8)),
             Action="lambda:InvokeFunction",
             Principal=principal,
             SourceArn=source_arn,
@@ -3229,18 +3523,17 @@ class Zappa:
         # and do not require event permissions. They do require additional permissions on the Lambda roles though.
         # http://docs.aws.amazon.com/lambda/latest/dg/lambda-api-permissions-ref.html
         pull_services = ["dynamodb", "kinesis", "sqs"]
-
-        # XXX: Not available in Lambda yet.
-        # We probably want to execute the latest code.
-        # if default:
-        #     lambda_arn = lambda_arn + ":$LATEST"
-
         self.unschedule_events(
             lambda_name=lambda_name,
             lambda_arn=lambda_arn,
             events=events,
             excluded_source_services=pull_services,
         )
+        # XXX: Not available in Lambda yet.
+        # We probably want to execute the latest code.
+        # if default:
+        #     lambda_arn = lambda_arn + ":$LATEST"
+
         for event in events:
             function = event["function"]
             expression = event.get("expression", None)  # single expression
@@ -3741,11 +4034,10 @@ class Zappa:
             if profile_name:
                 self.boto_session = boto3.Session(profile_name=profile_name, region_name=self.aws_region)
             elif os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
-                region_name = os.environ.get("AWS_DEFAULT_REGION") or self.aws_region
                 session_kw = {
                     "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID"),
                     "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
-                    "region_name": region_name,
+                    "region_name": self.aws_region,
                 }
 
                 # If we're executing in a role, AWS_SESSION_TOKEN will be present, too.
