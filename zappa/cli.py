@@ -128,6 +128,7 @@ class ZappaCLI:
     aws_kms_key_arn = ""
     snap_start = None
     capacity_provider_config = None
+    capacity_provider_publish_to_latest_published = False
     context_header_mappings = None
     additional_text_mimetypes = None
     tags = []  # type: ignore[var-annotated]
@@ -1161,7 +1162,6 @@ class ZappaCLI:
             num_revisions=self.num_retained_versions,
             concurrency=self.lambda_concurrency,
             capacity_provider_config=self.capacity_provider_config,
-            architecture=self.architecture,
         )
         if docker_image_uri:
             kwargs["docker_image_uri"] = docker_image_uri
@@ -1208,6 +1208,7 @@ class ZappaCLI:
             layers=self.layers,
             snap_start=self.snap_start,
             capacity_provider_config=self.capacity_provider_config,
+            capacity_provider_publish_to_latest_published=self.capacity_provider_publish_to_latest_published,
             wait=False,
             architecture=self.architecture,
         )
@@ -1396,6 +1397,11 @@ class ZappaCLI:
                 self.zappa.remove_api_key(api_id, self.api_stage)
 
             self.zappa.undeploy_api_gateway(self.lambda_name, domain_name=domain_name, base_path=base_path)
+
+        if self.use_function_url:
+            if self.function_url_domains:
+                self.zappa.undeploy_function_url_custom_domain(self.lambda_name)
+            self.zappa.delete_lambda_function_url(self.lambda_arn)
 
         self.unschedule()  # removes event triggers, including warm up event.
 
@@ -2702,6 +2708,9 @@ class ZappaCLI:
         self.aws_kms_key_arn = self.stage_config.get("aws_kms_key_arn", "")
         self.snap_start = self.stage_config.get("snap_start", "None")
         self.capacity_provider_config = self.stage_config.get("capacity_provider_config", None)
+        self.capacity_provider_publish_to_latest_published = self.stage_config.get(
+            "capacity_provider_publish_to_latest_published", False
+        )
         self.context_header_mappings = self.stage_config.get("context_header_mappings", {})
         self.xray_tracing = self.stage_config.get("xray_tracing", False)
         self.desired_role_arn = self.stage_config.get("role_arn")

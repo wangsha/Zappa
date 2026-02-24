@@ -324,6 +324,7 @@ class Zappa:
             self.dynamodb_client = self.boto_client("dynamodb")
             self.cognito_client = self.boto_client("cognito-idp")
             self.sts_client = self.boto_client("sts")
+            self.efs_client = self.boto_client("efs")
             self.cloudfront_client = self.boto_client("cloudfront")
 
         self.tags = tags
@@ -1261,6 +1262,14 @@ class Zappa:
                 "Remove VPC settings or disable the capacity provider."
             )
 
+        uses_capacity_provider = bool(capacity_provider_config)
+        uses_vpc = bool(vpc_config and (vpc_config.get("SubnetIds") or vpc_config.get("SecurityGroupIds")))
+        if uses_capacity_provider and uses_vpc:
+            raise ValueError(
+                "Lambda capacity providers cannot be used with VPC configurations. "
+                "Remove VPC settings or disable the capacity provider."
+            )
+
         kwargs = dict(
             FunctionName=function_name,
             Role=self.credentials_arn,
@@ -1355,7 +1364,7 @@ class Zappa:
         """
         logger.info("Updating Lambda function code..")
 
-        kwargs = dict(FunctionName=function_name, Publish=publish, Architectures=[architecture])
+        kwargs = dict(FunctionName=function_name, Publish=publish, Architectures=[self.architecture])
         if docker_image_uri:
             kwargs["ImageUri"] = docker_image_uri
         elif local_zip:
@@ -1436,9 +1445,7 @@ class Zappa:
         for version in versions["Versions"]:
             versions_in_lambda.append(version["Version"])
         while "NextMarker" in versions:
-            versions = self.lambda_client.list_versions_by_function(
-                    FunctionName=function_name, Marker=versions["NextMarker"]
-                )
+            versions = self.lambda_client.list_versions_by_function(FunctionName=function_name, Marker=versions["NextMarker"])
             for version in versions["Versions"]:
                 versions_in_lambda.append(version["Version"])
         return versions_in_lambda
@@ -1461,6 +1468,7 @@ class Zappa:
         layers=None,
         snap_start=None,
         capacity_provider_config=None,
+        capacity_provider_publish_to_latest_published=False,
         wait=True,
         architecture=None,
     ):
@@ -1547,26 +1555,34 @@ class Zappa:
             elif "capacity-provider:" in capacity_provider_name_part:
                 capacity_provider_name_part = capacity_provider_name_part.split("capacity-provider:", 1)[1]
             capacity_provider_name = capacity_provider_name_part.rsplit("/", 1)[-1]
-            # wait for latest version
+
             versions_in_lambda = self.list_lambda_function_versions(function_name=function_name)
-            latest_version = max(int(v) for v in versions_in_lambda if v.isdigit())
 
-            self.wait_for_capacity_provider_response(
-                capacity_provider_name=capacity_provider_name,
-                function_arn=f"{response["FunctionArn"]}:{latest_version}",
-                function_state="Active",
-            )
-      
-            # publish to latest
-            response = self.lambda_client.publish_version(FunctionName=function_name, PublishTo='LATEST_PUBLISHED')
-            logger.info(f"Publish to {response['FunctionArn']}")
+            if versions_in_lambda:
+                # wait for latest version
+                latest_version = max(int(v) for v in versions_in_lambda if v.isdigit())
 
-            time.sleep(10)
-            self.wait_for_capacity_provider_response(
-                capacity_provider_name=capacity_provider_name,
-                function_arn=response["FunctionArn"],
-                function_state="Active",
-            )
+                if latest_version:
+                    self.wait_for_capacity_provider_response(
+                        capacity_provider_name=capacity_provider_name,
+                        function_arn=f"{response["FunctionArn"]}:{latest_version}",
+                        function_state="Active",
+                    )
+
+            if capacity_provider_publish_to_latest_published:
+                if "$LATEST.PUBLISHED" in versions_in_lambda:
+                    self.lambda_client.delete_function(FunctionName=function_name, Qualifier="$LATEST.PUBLISHED")
+
+                # publish to latest
+                response = self.lambda_client.publish_version(FunctionName=function_name, PublishTo="LATEST_PUBLISHED")
+                logger.info(f"Publish to {response['FunctionArn']}")
+
+                time.sleep(10)
+                self.wait_for_capacity_provider_response(
+                    capacity_provider_name=capacity_provider_name,
+                    function_arn=response["FunctionArn"],
+                    function_state="Active",
+                )
 
         if self.tags:
             self.lambda_client.tag_resource(Resource=resource_arn, Tags=self.tags)
@@ -1684,7 +1700,6 @@ class Zappa:
         if marker:
             list_kwargs["Marker"] = marker
 
-
         logger.info(f"Wait for {function_arn} to be {function_state} ...")
         last_response = None
         for attempt in range(1, max_attempts + 1):
@@ -1704,7 +1719,7 @@ class Zappa:
             matched_item = None
             page = response or {}
             while True:
-                for item in (page.get("FunctionVersions") or []):
+                for item in page.get("FunctionVersions") or []:
                     arn = item.get("FunctionArn") or ""
                     if function_arn in arn:
                         matched_item = item
@@ -1730,7 +1745,7 @@ class Zappa:
                         f"Function version [{matched_item.get('FunctionArn')}] entered Failed state under "
                         f"capacity provider [{capacity_provider_name}]."
                     )
-                if normalized_state == "active" and state == 'Active':
+                if normalized_state == "active" and state == "Active":
                     return last_response
             else:
                 if normalized_state == "empty":
@@ -1887,7 +1902,6 @@ class Zappa:
         if not response.get("FunctionUrlConfigs", []):
             logger.info("no function url configured on lambda, skip setting custom domains")
         url = response["FunctionUrlConfigs"][0]["FunctionUrl"]
-        import urllib
 
         url = urllib.parse.urlparse(url)
 
@@ -2763,7 +2777,7 @@ class Zappa:
                 continue
             yield api
 
-    def undeploy_function_url_custom_domain(self, lambda_name, domains=None):
+    def undeploy_function_url_custom_domain(self, lambda_name):
 
         response = self.lambda_client.list_function_url_configs(FunctionName=lambda_name, MaxItems=50)
         if not response.get("FunctionUrlConfigs", []):
@@ -3296,7 +3310,7 @@ class Zappa:
             )
             certificate_arn = acm_certificate["CertificateArn"]
 
-        if use_apigateway:
+        if self.apigateway:
             self.update_domain_base_path_mapping(domain_name, lambda_name, stage, base_path)
 
             res = self.apigateway_client.update_domain_name(
@@ -3314,8 +3328,7 @@ class Zappa:
                     },
                 ],
             )
-        if use_function_url:
-            pass
+
         return res
 
     def update_domain_base_path_mapping(self, domain_name, lambda_name, stage, base_path):
