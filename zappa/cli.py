@@ -28,6 +28,8 @@ import argcomplete
 import botocore
 import click
 import hjson as json
+
+# import pkg_resources
 import requests
 import slugify
 import toml
@@ -202,6 +204,9 @@ class ZappaCLI:
 
         desc = "Zappa - Deploy Python applications to AWS Lambda" " and API Gateway.\n"
         parser = argparse.ArgumentParser(description=desc)
+        from importlib.metadata import version
+
+        zappa_version = version("zappa")
         parser.add_argument(
             "-v",
             "--version",
@@ -592,7 +597,7 @@ class ZappaCLI:
                     + click.style(self.api_stage, bold=True)
                     + ".."
                 )
-
+        click.echo(self.vargs)
         # Explicitly define the app function.
         # Related: https://github.com/Miserlou/Zappa/issues/832
         if self.vargs.get("app_function", None):
@@ -918,6 +923,7 @@ class ZappaCLI:
                 use_alb=self.use_alb,
                 layers=self.layers,
                 concurrency=self.lambda_concurrency,
+                architecture=self.architecture,
             )
             kwargs["function_name"] = self.lambda_name
             if docker_image_uri:
@@ -1031,7 +1037,8 @@ class ZappaCLI:
         """
         Repackage and update the function code.
         """
-
+        click.echo(self.stage_config)
+        click.echo(self.zappa.aws_region)
         if not source_zip and not docker_image_uri:
             # Make sure we're in a venv.
             self.check_venv()
@@ -1154,6 +1161,7 @@ class ZappaCLI:
             num_revisions=self.num_retained_versions,
             concurrency=self.lambda_concurrency,
             capacity_provider_config=self.capacity_provider_config,
+            architecture=self.architecture,
         )
         if docker_image_uri:
             kwargs["docker_image_uri"] = docker_image_uri
@@ -1201,6 +1209,7 @@ class ZappaCLI:
             snap_start=self.snap_start,
             capacity_provider_config=self.capacity_provider_config,
             wait=False,
+            architecture=self.architecture,
         )
 
         # Finally, delete the local copy our zip package
@@ -3442,6 +3451,9 @@ class ZappaCLI:
                 + click.style(str(req.status_code), fg="red", bold=True)
                 + " response code."
             )
+
+        if req.status_code == 200:
+            click.echo(req.text)
 
 
 ####################################################################
