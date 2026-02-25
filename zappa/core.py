@@ -1696,7 +1696,6 @@ class Zappa:
             matched_item = None
             page = response or {}
             while True:
-                for item in page.get("FunctionVersions") or []:
                 for item in (page.get("FunctionVersions") or []):
                     arn = item.get("FunctionArn") or ""
                     if function_arn in arn:
