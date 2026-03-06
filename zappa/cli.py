@@ -19,7 +19,6 @@ import sys
 import tempfile
 import time
 import zipfile
-from builtins import bytes, input
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -125,6 +124,7 @@ class ZappaCLI:
     xray_tracing = False
     aws_kms_key_arn = ""
     snap_start = None
+    capacity_provider_config = None
     context_header_mappings = None
     additional_text_mimetypes = None
     tags = []  # type: ignore[var-annotated]
@@ -913,6 +913,7 @@ class ZappaCLI:
                 runtime=self.runtime,
                 aws_environment_variables=self.aws_environment_variables,
                 aws_kms_key_arn=self.aws_kms_key_arn,
+                capacity_provider_config=self.capacity_provider_config,
                 use_alb=self.use_alb,
                 layers=self.layers,
                 concurrency=self.lambda_concurrency,
@@ -954,7 +955,8 @@ class ZappaCLI:
                 function_name=self.lambda_arn,
                 function_url_config=self.function_url_config,
             )
-            self.zappa.deploy_lambda_function_url(**kwargs)
+            endpoint_url = self.zappa.deploy_lambda_function_url(**kwargs)
+            self.zappa.wait_until_lambda_function_is_updated(function_name=self.lambda_name)
 
         if self.use_apigateway:
             # Create and configure the API Gateway
@@ -969,6 +971,7 @@ class ZappaCLI:
                 endpoint_configuration=self.endpoint_configuration,
                 apigateway_version=self.apigateway_version,
                 stage_name=self.api_stage,
+                websocket=self.use_websocket,
             )
 
             self.zappa.update_stack(
@@ -1008,9 +1011,8 @@ class ZappaCLI:
                 else:
                     self.zappa.add_api_stage_to_api_key(api_key=self.api_key, api_id=api_id, stage_name=self.api_stage)
 
-            if self.stage_config.get("touch", True):
-                self.zappa.wait_until_lambda_function_is_updated(function_name=self.lambda_name)
-                self.touch_endpoint(endpoint_url)
+        if self.stage_config.get("touch", True):
+            self.touch_endpoint(endpoint_url)
 
         # Finally, delete the local copy our zip package
         if not source_zip and not docker_image_uri:
@@ -1024,6 +1026,11 @@ class ZappaCLI:
         self.callback("post")
 
         click.echo(deployment_string)
+
+        if self.use_websocket:
+            ws_url = self.zappa.get_websocket_url(self.lambda_name, self.api_stage)
+            if ws_url:
+                click.echo("WebSocket URL: " + click.style(ws_url, bold=True))
 
     def update(self, source_zip=None, no_upload=False, docker_image_uri=None):
         """
@@ -1151,6 +1158,7 @@ class ZappaCLI:
             function_name=self.lambda_name,
             num_revisions=self.num_retained_versions,
             concurrency=self.lambda_concurrency,
+            capacity_provider_config=self.capacity_provider_config,
         )
         if docker_image_uri:
             kwargs["docker_image_uri"] = docker_image_uri
@@ -1196,6 +1204,7 @@ class ZappaCLI:
             aws_kms_key_arn=self.aws_kms_key_arn,
             layers=self.layers,
             snap_start=self.snap_start,
+            capacity_provider_config=self.capacity_provider_config,
             wait=False,
         )
 
@@ -1216,6 +1225,7 @@ class ZappaCLI:
                 endpoint_configuration=self.endpoint_configuration,
                 apigateway_version=self.apigateway_version,
                 stage_name=self.api_stage,
+                websocket=self.use_websocket,
             )
             self.zappa.update_stack(
                 self.lambda_name,
@@ -1264,7 +1274,7 @@ class ZappaCLI:
                 function_name=self.lambda_arn,
                 function_url_config=self.function_url_config,
             )
-            self.zappa.update_lambda_function_url(**kwargs)
+            endpoint_url = self.zappa.update_lambda_function_url(**kwargs)[:-1]
         else:
             self.zappa.delete_lambda_function_url(self.lambda_arn)
 
@@ -1283,6 +1293,7 @@ class ZappaCLI:
             endpoint_url += "/" + self.base_path
 
         deployed_string = "Your updated Zappa deployment is " + click.style("live", fg="green", bold=True) + "!"
+        touch_url = endpoint_url
         if self.use_apigateway:
             deployed_string = deployed_string + ": " + click.style("{}".format(endpoint_url), bold=True)
 
@@ -1292,15 +1303,18 @@ class ZappaCLI:
 
                 if endpoint_url != api_url:
                     deployed_string = deployed_string + " (" + api_url + ")"
-
-            if self.stage_config.get("touch", True):
-                self.zappa.wait_until_lambda_function_is_updated(function_name=self.lambda_name)
                 if api_url:
-                    self.touch_endpoint(api_url)
-                elif endpoint_url:
-                    self.touch_endpoint(endpoint_url)
+                    touch_url = api_url
+
+        if self.stage_config.get("touch", True):
+            self.touch_endpoint(touch_url)
 
         click.echo(deployed_string)
+
+        if self.use_websocket:
+            ws_url = self.zappa.get_websocket_url(self.lambda_name, self.api_stage)
+            if ws_url:
+                click.echo("WebSocket URL: " + click.style(ws_url, bold=True))
 
     def rollback(self, revision):
         """
@@ -1381,6 +1395,11 @@ class ZappaCLI:
                 self.zappa.remove_api_key(api_id, self.api_stage)
 
             self.zappa.undeploy_api_gateway(self.lambda_name, domain_name=domain_name, base_path=base_path)
+
+        if self.use_function_url:
+            if self.function_url_domains:
+                self.zappa.undeploy_function_url_custom_domain(self.lambda_name)
+            self.zappa.delete_lambda_function_url(self.lambda_arn)
 
         self.unschedule()  # removes event triggers, including warm up event.
 
@@ -1499,7 +1518,7 @@ class ZappaCLI:
 
     def unschedule(self):
         """
-        Given a a list of scheduled functions,
+        Given a list of scheduled functions,
         tear down their regular execution.
         """
 
@@ -1557,6 +1576,7 @@ class ZappaCLI:
             invocation_type="RequestResponse",
             client_context=client_context,
             qualifier=qualifier,
+            log_type="Tail" if not self.capacity_provider_config else "None",
         )
 
         print(self.format_lambda_response(response, not no_color))
@@ -2300,7 +2320,7 @@ class ZappaCLI:
         Register or update a domain certificate for this env.
         """
 
-        if not self.domain:
+        if not (self.domain or self.function_url_domains):
             raise ClickException(
                 "Can't certify a domain without " + click.style("domain", fg="red", bold=True) + " configured!"
             )
@@ -2381,19 +2401,19 @@ class ZappaCLI:
                 certificate_chain = f.read()
 
         click.echo("Certifying domain " + click.style(self.domain, fg="green", bold=True) + "..")
+        route53 = self.stage_config.get("route53_enabled", True)
 
-        # Get cert and update domain.
+        # Get cert and update domain for api_gateway
+        if self.use_apigateway:
+            # Let's Encrypt
+            if not cert_location and not cert_arn:
+                from .letsencrypt import get_cert_and_update_domain
 
-        # Let's Encrypt
-        if not cert_location and not cert_arn:
-            from .letsencrypt import get_cert_and_update_domain
+                cert_success = get_cert_and_update_domain(self.zappa, self.lambda_name, self.api_stage, self.domain, manual)
 
-            cert_success = get_cert_and_update_domain(self.zappa, self.lambda_name, self.api_stage, self.domain, manual)
+            # Custom SSL / ACM
+            else:
 
-        # Custom SSL / ACM
-        else:
-            route53 = self.stage_config.get("route53_enabled", True)
-            if self.use_apigateway:
                 if not self.zappa.get_domain_name(self.domain, route53=route53):
                     dns_name = self.zappa.create_domain_name(
                         domain_name=self.domain,
@@ -2428,28 +2448,29 @@ class ZappaCLI:
                     )
 
                 cert_success = True
+                if cert_success:
+                    click.echo("Certificate " + click.style("updated", fg="green", bold=True) + "!")
+                else:
+                    click.echo(click.style("Failed", fg="red", bold=True) + " to generate or install certificate! :(")
+                    click.echo("\n==============\n")
+                    shamelessly_promote()
 
-            if self.use_function_url:
-                self.lambda_arn = self.zappa.get_lambda_function(function_name=self.lambda_name)
-                dns_name = self.zappa.update_lambda_function_url_domains(
-                    self.lambda_arn, self.function_url_domains, cert_arn, self.function_url_cloudfront_config
-                )
-                if route53:
-                    for domain in self.function_url_domains:
-                        self.zappa.update_route53_records(domain, dns_name)
-                print(
-                    "Created a new domain name with supplied certificate. "
-                    "Please note that it can take up to 40 minutes for this domain to be "
-                    "created and propagated through AWS, but it requires no further work on your part."
-                )
-            cert_success = True
-
-        if cert_success:
-            click.echo("Certificate " + click.style("updated", fg="green", bold=True) + "!")
-        else:
-            click.echo(click.style("Failed", fg="red", bold=True) + " to generate or install certificate! :(")
-            click.echo("\n==============\n")
-            shamelessly_promote()
+        if self.use_function_url:
+            self.lambda_arn = self.zappa.get_lambda_function(function_name=self.lambda_name)
+            dns_name = self.zappa.update_lambda_function_url_domains(
+                self.lambda_arn,
+                self.function_url_domains,
+                cert_arn,
+                self.function_url_cloudfront_config,
+            )
+            if route53:
+                for domain in self.function_url_domains:
+                    self.zappa.update_route53_records(domain, dns_name)
+            print(
+                "Created a new domain name with supplied certificate. "
+                "Please note that it can take up to 40 minutes for this domain to be "
+                "created and propagated through AWS, but it requires no further work on your part."
+            )
 
     ##
     # Shell
@@ -2624,6 +2645,7 @@ class ZappaCLI:
             raise ClickException("Please provide a valid ephemeral_storage size between 512 - 10240 in your Zappa settings.")
 
         self.app_function = self.stage_config.get("app_function", None)
+        self.app_type = self.stage_config.get("app_type", None)
         self.exception_handler = self.stage_config.get("exception_handler", None)
         self.aws_region = self.stage_config.get("aws_region", None)
         self.debug = self.stage_config.get("debug", True)
@@ -2679,6 +2701,7 @@ class ZappaCLI:
         self.runtime = self.stage_config.get("runtime", get_runtime_from_python_version())
         self.aws_kms_key_arn = self.stage_config.get("aws_kms_key_arn", "")
         self.snap_start = self.stage_config.get("snap_start", "None")
+        self.capacity_provider_config = self.stage_config.get("capacity_provider_config", None)
         self.context_header_mappings = self.stage_config.get("context_header_mappings", {})
         self.xray_tracing = self.stage_config.get("xray_tracing", False)
         self.desired_role_arn = self.stage_config.get("role_arn")
@@ -2711,6 +2734,26 @@ class ZappaCLI:
         }
         default_function_url_config.update(self.stage_config.get("function_url_config", {}))
         self.function_url_config = default_function_url_config
+
+        # WebSocket support - explicit setting or auto-detected from zappa.websocket imports
+        websocket_handler_module = self.stage_config.get("websocket_handler_module")
+        if websocket_handler_module:
+            if not isinstance(websocket_handler_module, str):
+                raise ClickException(
+                    "The 'websocket_handler_module' setting must be a string dotted module path, "
+                    f"got {type(websocket_handler_module).__name__} instead."
+                )
+            if websocket_handler_module.endswith(".py"):
+                raise ClickException(
+                    "The 'websocket_handler_module' setting must be a dotted module path "
+                    "(e.g. 'my_package.ws_handlers'), not a filesystem path ending in '.py'."
+                )
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$", websocket_handler_module):
+                raise ClickException(
+                    "Invalid 'websocket_handler_module' setting. Expected a dotted module path "
+                    "(e.g. 'my_package.ws_handlers')."
+                )
+        self.use_websocket = websocket_handler_module or self._detect_websocket_usage()
 
         # Additional tags
         self.tags = self.stage_config.get("tags", {})
@@ -2754,6 +2797,27 @@ class ZappaCLI:
                 self.zappa.extra_permissions.append(efs_permission)
             else:
                 self.zappa.extra_permissions = [efs_permission]
+
+        # Automatically add execute-api:ManageConnections when WebSocket is enabled
+        if self.use_websocket and self.manage_roles:
+            ws_resource_arn = f"arn:aws:execute-api:{self.aws_region}:*:*"
+            try:
+                sts_client = self.zappa.boto_session.client("sts")
+                account_id = sts_client.get_caller_identity()["Account"]
+                ws_resource_arn = f"arn:aws:execute-api:{self.aws_region}:{account_id}:*"
+            except Exception:
+                pass
+            ws_permission = {
+                "Effect": "Allow",
+                "Action": [
+                    "execute-api:ManageConnections",
+                ],
+                "Resource": ws_resource_arn,
+            }
+            if self.zappa.extra_permissions:
+                self.zappa.extra_permissions.append(ws_permission)
+            else:
+                self.zappa.extra_permissions = [ws_permission]
 
         if self.app_function:
             self.collision_warning(self.app_function)
@@ -2951,6 +3015,12 @@ class ZappaCLI:
                 )
             app_module, app_function = self.app_function.rsplit(".", 1)
             settings_s = settings_s + "APP_MODULE='{0!s}'\nAPP_FUNCTION='{1!s}'\n".format(app_module, app_function)
+
+        if self.app_type:
+            settings_s += "APP_TYPE='{0!s}'\n".format(self.app_type)
+
+        if self.use_websocket:
+            settings_s += "WEBSOCKET_HANDLER_MODULE='{0!s}'\n".format(self.use_websocket)
 
         if self.exception_handler:
             settings_s += "EXCEPTION_HANDLER='{0!s}'\n".format(self.exception_handler)
@@ -3355,6 +3425,65 @@ class ZappaCLI:
             cache_cluster_encrypted=self.stage_config.get("cache_cluster_encrypted", False),
         )
         return endpoint_url
+
+    @staticmethod
+    def _detect_websocket_usage():
+        """Walk the project directory looking for zappa.websocket imports.
+
+        Returns the dotted module path of the first file found (e.g.
+        ``"ws_handlers"`` or ``"mypackage.ws"``), or ``None`` if no
+        WebSocket usage is detected.  The return value is truthy/falsy
+        so existing ``if self.use_websocket:`` checks still work.
+        """
+        import ast
+
+        skip_dirs = {".", "__pycache__", "node_modules", ".git", ".tox", ".eggs", "venv", "env", ".venv"}
+        for dirpath, dirnames, filenames in os.walk("."):
+            # Skip hidden dirs, venvs, caches
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+            for fname in filenames:
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        source = f.read()
+                except OSError:
+                    continue
+                if "zappa.websocket" not in source:
+                    continue
+                try:
+                    tree = ast.parse(source, filename=fpath)
+                except SyntaxError:
+                    continue
+                for node in ast.walk(tree):
+                    has_import = False
+                    if (
+                        isinstance(node, ast.ImportFrom)
+                        and node.module
+                        and (node.module == "zappa.websocket" or node.module.startswith("zappa.websocket."))
+                    ):
+                        has_import = True
+                    elif isinstance(node, ast.Import):
+                        for alias in node.names:
+                            if alias.name and (alias.name == "zappa.websocket" or alias.name.startswith("zappa.websocket.")):
+                                has_import = True
+                                break
+                    if has_import:
+                        # Convert file path to dotted module name
+                        # "./ws_handlers.py" -> "ws_handlers"
+                        # "./pkg/ws.py" -> "pkg.ws"
+                        # "./pkg/__init__.py" -> "pkg"
+                        module_path = os.path.normpath(fpath)
+                        if module_path.startswith("." + os.sep):
+                            module_path = module_path[2:]
+                        module_path = module_path[: -len(".py")]
+                        if module_path.endswith(os.sep + "__init__") or module_path == "__init__":
+                            module_path = module_path[: -len("__init__")].rstrip(os.sep)
+                            if not module_path:
+                                continue
+                        return module_path.replace(os.sep, ".")
+        return None
 
     def check_venv(self):
         """Ensure we're inside a virtualenv."""
