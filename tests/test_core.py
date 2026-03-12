@@ -868,6 +868,60 @@ class TestZappa(unittest.TestCase):
             z.update_lambda_configuration("test", "test", "test")
             self.assertEqual(mock_client.update_function_configuration.call_args[1]["Layers"], [])
 
+    def test_update_capacity_provider_configuration(self):
+        z = Zappa(load_credentials=False)
+        z.credentials_arn = object()
+        z.lambda_client = mock.MagicMock()
+        z.lambda_client.get_function_configuration.return_value = {"PackageType": "Zip"}
+        capacity_provider_arn = "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test"
+        z.lambda_client.list_function_versions_by_capacity_provider.return_value = {
+            "CapacityProviderArn": capacity_provider_arn,
+            "FunctionVersions": [
+                {"FunctionArn": "test", "State": "Active"},
+            ],
+            "NextMarker": "",
+        }
+        z.lambda_client.publish_version.return_value = {
+            "FunctionArn": "test",
+        }
+        z.wait_until_lambda_function_is_updated = mock.MagicMock()
+        capacity_provider_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": capacity_provider_arn,
+                "PerExecutionEnvironmentMaxConcurrency": 10,
+                "ExecutionEnvironmentMemoryGiBPerVCpu": 4.0,
+            }
+        }
+
+        z.update_lambda_configuration(
+            "test",
+            "test",
+            "test",
+            capacity_provider_config=capacity_provider_config,
+        )
+
+        self.assertEqual(
+            z.lambda_client.update_function_configuration.call_args[1]["CapacityProviderConfig"],
+            capacity_provider_config,
+        )
+
+    def test_update_capacity_provider_rejects_vpc(self):
+        z = Zappa(load_credentials=False)
+        z.credentials_arn = object()
+        z.lambda_client = mock.MagicMock()
+
+        with self.assertRaises(ValueError):
+            z.update_lambda_configuration(
+                "arn",
+                "name",
+                "handler",
+                vpc_config={"SubnetIds": ["subnet-1"], "SecurityGroupIds": ["sg-1"]},
+                capacity_provider_config={
+                    "LambdaManagedInstancesCapacityProviderConfig": {"CapacityProviderArn": "arn:aws:lambda:::capacity"}
+                },
+                wait=False,
+            )
+
     def test_snap_start_configuration(self):
         """
         Test that SnapStart configuration is correctly set in Lambda configuration.
@@ -883,6 +937,22 @@ class TestZappa(unittest.TestCase):
         zappa_cli.api_stage = "snap_start_disabled"
         zappa_cli.load_settings("tests/test_settings.yaml")
         self.assertEqual("None", zappa_cli.snap_start)
+
+    def test_capacity_provider_configuration(self):
+        """
+        Test that capacity provider configuration is loaded from settings.
+        """
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "capacity_provider_enabled"
+        zappa_cli.load_settings("tests/test_settings.yaml")
+        expected_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test",
+                "PerExecutionEnvironmentMaxConcurrency": 5,
+                "ExecutionEnvironmentMemoryGiBPerVCpu": 2.0,
+            }
+        }
+        self.assertEqual(expected_config, zappa_cli.capacity_provider_config)
 
     def test_update_empty_aws_env_hash(self):
         z = Zappa()
@@ -1603,6 +1673,61 @@ class TestZappa(unittest.TestCase):
                 # delete the file
                 if os.path.exists("zappa_settings.json"):
                     os.remove("zappa_settings.json")
+            finally:
+                os.chdir(current_dir)
+
+    def test_zappa_init_django_excludes_app_function(self):
+        """
+        Regression test for https://github.com/zappa/Zappa/issues/1404
+        Django projects should have django_settings but NOT app_function
+        in the generated zappa_settings.json.
+        """
+        current_dir = os.getcwd()
+        with tempfile.TemporaryDirectory(prefix="zappa_test") as tempdir:
+            try:
+                os.chdir(tempdir)
+                tempdir = Path(tempdir)
+
+                settings_filepath = tempdir / "zappa_settings.json"
+
+                zappa_cli = ZappaCLI()
+
+                # Mock Django as importable so has_django=True
+                django_mock = mock.MagicMock()
+                with mock.patch.dict("sys.modules", {"django": django_mock}), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_env", return_value="dev"
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_profile",
+                    return_value=("default", {"region": "us-east-1"}),
+                ), mock.patch(
+                    "zappa.cli.detect_django_settings",
+                    return_value=["my_project.settings"],
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_django_settings",
+                    return_value="my_project.settings",
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_bucket",
+                    return_value="my-zappa-bucket",
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_global_settings",
+                    return_value=["n", False],
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_confirm", return_value="y"
+                ):
+                    zappa_cli.init()
+
+                self.assertTrue(settings_filepath.exists())
+
+                with settings_filepath.open("r") as f:
+                    zappa_settings = json.load(f)
+
+                dev_settings = zappa_settings["dev"]
+                self.assertEqual(dev_settings["django_settings"], "my_project.settings")
+                self.assertNotIn(
+                    "app_function",
+                    dev_settings,
+                    "Django projects must not have app_function in settings (issue #1404)",
+                )
             finally:
                 os.chdir(current_dir)
 
@@ -2373,6 +2498,95 @@ class TestZappa(unittest.TestCase):
 
         colorized_string = zappa_cli.colorize_invoke_command(plain_string)
         self.assertEqual(final_string, colorized_string)
+
+    @mock.patch("zappa.cli.ZappaCLI.format_lambda_response")
+    @mock.patch("zappa.core.Zappa.invoke_lambda_function")
+    def test_invoke_with_payload(self, mock_invoke, mock_format):
+        """Test that --payload merges JSON into the invoke event."""
+        mock_invoke.return_value = {"StatusCode": 200}
+        mock_format.return_value = "ok"
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+        zappa_cli.zappa.invoke_lambda_function = mock_invoke
+
+        zappa_cli.invoke(
+            "my_app.my_function",
+            payload='{"key1": "value1", "key2": "value2"}',
+        )
+
+        call_args = mock_invoke.call_args
+        sent_payload = json.loads(call_args[0][1])
+        self.assertEqual(sent_payload["command"], "my_app.my_function")
+        self.assertEqual(sent_payload["key1"], "value1")
+        self.assertEqual(sent_payload["key2"], "value2")
+
+    @mock.patch("zappa.cli.ZappaCLI.format_lambda_response")
+    @mock.patch("zappa.core.Zappa.invoke_lambda_function")
+    def test_invoke_with_payload_raw_python(self, mock_invoke, mock_format):
+        """Test that --payload works with --raw."""
+        mock_invoke.return_value = {"StatusCode": 200}
+        mock_format.return_value = "ok"
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+        zappa_cli.zappa.invoke_lambda_function = mock_invoke
+
+        zappa_cli.invoke(
+            "print('hello')",
+            raw_python=True,
+            payload='{"extra": "data"}',
+        )
+
+        call_args = mock_invoke.call_args
+        sent_payload = json.loads(call_args[0][1])
+        self.assertEqual(sent_payload["raw_command"], "print('hello')")
+        self.assertEqual(sent_payload["extra"], "data")
+
+    def test_invoke_with_invalid_payload_json(self):
+        """Test that invalid JSON in --payload raises ClickException."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+
+        with self.assertRaises(ClickException) as cm:
+            zappa_cli.invoke("my_app.my_function", payload="not-valid-json")
+        self.assertIn("--payload must be valid JSON", str(cm.exception))
+
+    def test_invoke_with_non_dict_payload(self):
+        """Test that a non-dict JSON payload raises ClickException."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+
+        with self.assertRaises(ClickException) as cm:
+            zappa_cli.invoke("my_app.my_function", payload='["a", "b"]')
+        self.assertIn("--payload must be a JSON object", str(cm.exception))
+
+    @mock.patch("zappa.cli.ZappaCLI.format_lambda_response")
+    @mock.patch("zappa.core.Zappa.invoke_lambda_function")
+    def test_invoke_without_payload(self, mock_invoke, mock_format):
+        """Test that invoke without --payload works as before."""
+        mock_invoke.return_value = {"StatusCode": 200}
+        mock_format.return_value = "ok"
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+        zappa_cli.zappa.invoke_lambda_function = mock_invoke
+
+        zappa_cli.invoke("my_app.my_function")
+
+        call_args = mock_invoke.call_args
+        sent_payload = json.loads(call_args[0][1])
+        self.assertEqual(sent_payload, {"command": "my_app.my_function"})
 
     @mock.patch("zappa.cli.ZappaCLI.colorize_invoke_command")
     @mock.patch("zappa.cli.ZappaCLI.format_invoke_command")
@@ -3439,6 +3653,168 @@ class TestZappa(unittest.TestCase):
         elbv2_stubber.activate()
         zappa_core.undeploy_lambda_alb(**kwargs)
 
+    def test_create_lambda_capacity_provider_config(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.credentials_arn = "arn:aws:iam::123:role/zappa"
+        zappa_core.lambda_client = mock.MagicMock()
+        zappa_core.wait_until_lambda_function_is_active = mock.MagicMock()
+        zappa_core.lambda_client.create_function.return_value = {
+            "FunctionArn": "abc",
+            "Version": 1,
+        }
+        capacity_provider_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test",
+                "PerExecutionEnvironmentMaxConcurrency": 3,
+                "ExecutionEnvironmentMemoryGiBPerVCpu": 2.0,
+            }
+        }
+
+        zappa_core.create_lambda_function(
+            function_name="abc",
+            handler="handler.lambda_handler",
+            docker_image_uri="123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:latest",
+            capacity_provider_config=capacity_provider_config,
+        )
+
+        self.assertEqual(
+            zappa_core.lambda_client.create_function.call_args[1]["CapacityProviderConfig"],
+            capacity_provider_config,
+        )
+
+    def test_wait_for_capacity_provider_response(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        expected = {"FunctionVersions": []}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.return_value = expected
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            function_arn=None,
+            capacity_provider_name="provider",
+        )
+
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.assert_called_with(
+            CapacityProviderName="provider",
+        )
+        self.assertEqual(result, expected)
+
+    def test_wait_for_capacity_provider_response_waits_until_active(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        function_arn = "arn:aws:lambda:us-east-1:123:function:test:1"
+        pending = {"FunctionVersions": [{"FunctionArn": function_arn, "State": "Pending"}]}
+        active = {"FunctionVersions": [{"FunctionArn": function_arn, "State": "Active"}]}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.side_effect = [pending, active]
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            capacity_provider_name="provider",
+            function_arn=function_arn,
+            function_state="Active",
+            max_attempts=2,
+            delay_seconds=0,
+        )
+
+        self.assertEqual(result, active)
+        self.assertEqual(zappa_core.lambda_client.list_function_versions_by_capacity_provider.call_count, 2)
+
+    def test_wait_for_capacity_provider_response_waits_until_empty(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        function_arn = "arn:aws:lambda:us-east-1:123:function:test:1"
+        present = {"FunctionVersions": [{"FunctionArn": function_arn, "State": "Pending"}]}
+        gone = {"FunctionVersions": []}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.side_effect = [present, gone]
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            capacity_provider_name="provider",
+            function_arn=function_arn,
+            function_state="Empty",
+            max_attempts=2,
+            delay_seconds=0,
+        )
+
+        self.assertEqual(result, gone)
+        self.assertEqual(zappa_core.lambda_client.list_function_versions_by_capacity_provider.call_count, 2)
+
+    def test_wait_for_capacity_provider_response_exits_on_failed(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        function_arn = "arn:aws:lambda:us-east-1:123:function:test:1"
+        failed = {"FunctionVersions": [{"FunctionArn": function_arn, "State": "Failed"}]}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.return_value = failed
+
+        with self.assertRaises(RuntimeError):
+            zappa_core.wait_for_capacity_provider_response(
+                capacity_provider_name="provider",
+                function_arn=function_arn,
+                function_state="Active",
+                max_attempts=1,
+                delay_seconds=0,
+            )
+
+        with self.assertRaises(RuntimeError):
+            zappa_core.wait_for_capacity_provider_response(
+                capacity_provider_name="provider",
+                function_arn=function_arn,
+                function_state="Empty",
+                max_attempts=1,
+                delay_seconds=0,
+            )
+
+    def test_wait_for_capacity_provider_response_passes_marker(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        expected = {"FunctionVersions": []}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.return_value = expected
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            function_arn=None,
+            capacity_provider_name="provider",
+            marker="m",
+        )
+
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.assert_called_with(
+            CapacityProviderName="provider",
+            Marker="m",
+        )
+        self.assertEqual(result, expected)
+
+    def test_wait_for_capacity_provider_response_retries(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.lambda_client = mock.MagicMock()
+        error = botocore.exceptions.ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ListFunctionVersionsByCapacityProvider"
+        )
+        success = {"FunctionVersions": [{"FunctionVersion": "1"}]}
+        zappa_core.lambda_client.list_function_versions_by_capacity_provider.side_effect = [error, success]
+
+        result = zappa_core.wait_for_capacity_provider_response(
+            function_arn=None,
+            capacity_provider_name="provider",
+            max_attempts=2,
+            delay_seconds=0,
+        )
+
+        self.assertEqual(result, success)
+        self.assertEqual(zappa_core.lambda_client.list_function_versions_by_capacity_provider.call_count, 2)
+
+    def test_create_lambda_capacity_provider_rejects_vpc(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.credentials_arn = "arn:aws:iam::123:role/zappa"
+        zappa_core.lambda_client = mock.MagicMock()
+
+        with self.assertRaises(ValueError):
+            zappa_core.create_lambda_function(
+                function_name="abc",
+                handler="handler.lambda_handler",
+                bucket="bucket",
+                s3_key="key",
+                capacity_provider_config={
+                    "LambdaManagedInstancesCapacityProviderConfig": {"CapacityProviderArn": "arn:aws:lambda:::capacity"}
+                },
+                vpc_config={"SubnetIds": ["subnet-1"], "SecurityGroupIds": ["sg-1"]},
+            )
+
     @mock.patch("botocore.client")
     def test_set_lambda_concurrency(self, client):
         boto_mock = mock.MagicMock()
@@ -3469,6 +3845,7 @@ class TestZappa(unittest.TestCase):
             aws_region="test",
             load_credentials=True,
         )
+        zappa_core.lambda_client.get_function_configuration.return_value = {}
         zappa_core.lambda_client.create_function.return_value = {
             "FunctionArn": "abc",
             "Version": 1,
@@ -3485,6 +3862,52 @@ class TestZappa(unittest.TestCase):
         boto_mock.client().delete_function_concurrency.assert_not_called()
 
     @mock.patch("botocore.client")
+    def test_update_lambda_concurrency_skipped_for_capacity_provider(self, client):
+        boto_mock = mock.MagicMock()
+        zappa_core = Zappa(
+            boto_session=boto_mock,
+            profile_name="test",
+            aws_region="test",
+            load_credentials=True,
+        )
+        zappa_core.lambda_client.create_function.return_value = {
+            "FunctionArn": "abc",
+            "Version": 1,
+        }
+        zappa_core.lambda_client.get_function_configuration.return_value = {"CapacityProviderConfig": {"foo": "bar"}}
+
+        zappa_core.update_lambda_function(bucket="test", function_name="abc")
+
+        boto_mock.client().put_function_concurrency.assert_not_called()
+        boto_mock.client().delete_function_concurrency.assert_not_called()
+
+    def test_create_lambda_capacity_provider_skips_concurrency(self):
+        zappa_core = Zappa(load_credentials=False)
+        zappa_core.credentials_arn = "arn:aws:iam::123:role/zappa"
+        zappa_core.lambda_client = mock.MagicMock()
+        zappa_core.wait_until_lambda_function_is_active = mock.MagicMock()
+        zappa_core.lambda_client.create_function.return_value = {
+            "FunctionArn": "abc",
+            "Version": 1,
+        }
+        capacity_provider_config = {
+            "LambdaManagedInstancesCapacityProviderConfig": {
+                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test",
+            }
+        }
+
+        zappa_core.create_lambda_function(
+            function_name="abc",
+            handler="handler.lambda_handler",
+            bucket="bucket",
+            s3_key="key",
+            capacity_provider_config=capacity_provider_config,
+            concurrency=5,
+        )
+
+        zappa_core.lambda_client.put_function_concurrency.assert_not_called()
+
+    @mock.patch("botocore.client")
     def test_delete_lambda_concurrency(self, client):
         boto_mock = mock.MagicMock()
         zappa_core = Zappa(
@@ -3493,6 +3916,7 @@ class TestZappa(unittest.TestCase):
             aws_region="test",
             load_credentials=True,
         )
+        zappa_core.lambda_client.get_function_configuration.return_value = {}
         zappa_core.lambda_client.create_function.return_value = {
             "FunctionArn": "abc",
             "Version": 1,
@@ -3790,6 +4214,39 @@ class TestZappa(unittest.TestCase):
         boto_mock.client().add_permission.assert_not_called()
         boto_mock.client().create_function_url_config.assert_not_called()
         boto_mock.client().update_function_url_config.assert_not_called()
+
+    @mock.patch("botocore.client")
+    def test_delete_lambda_function_url_unsupported_region(self, client):
+        """In regions where Lambda Function URLs are not supported,
+        list_function_url_configs raises ClientError. delete_lambda_function_url
+        should catch it and return early without attempting any deletes."""
+        boto_mock = mock.MagicMock()
+        zappa_core = Zappa(
+            boto_session=boto_mock,
+            profile_name="test",
+            aws_region="eu-south-2",
+            load_credentials=True,
+        )
+        function_name = "abc"
+        function_arn = "arn:aws:lambda:eu-south-2:123456789:function:{}".format(function_name)
+
+        error_response = {
+            "Error": {
+                "Code": "AccessDeniedException",
+                "Message": "User is not authorized to perform: lambda:ListFunctionUrlConfigs",
+            }
+        }
+        zappa_core.lambda_client.list_function_url_configs.side_effect = botocore.exceptions.ClientError(
+            error_response, "ListFunctionUrlConfigs"
+        )
+
+        # Should not raise — returns early
+        zappa_core.delete_lambda_function_url(function_name=function_arn)
+
+        # Verify no delete or policy operations were attempted
+        boto_mock.client().delete_function_url_config.assert_not_called()
+        boto_mock.client().get_policy.assert_not_called()
+        boto_mock.client().remove_permission.assert_not_called()
 
     # Issue #1407: API Gateway v2 update returns 500 on status check
     # https://github.com/zappa/Zappa/issues/1407
