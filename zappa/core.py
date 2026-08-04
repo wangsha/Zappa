@@ -1423,8 +1423,8 @@ class Zappa:
             versions = self.lambda_client.list_versions_by_function(
                     FunctionName=function_name, Marker=versions["NextMarker"]
                 )
-                for version in versions["Versions"]:
-                    versions_in_lambda.append(version["Version"])
+            for version in versions["Versions"]:
+                versions_in_lambda.append(version["Version"])
             versions_in_lambda.remove("$LATEST")
             versions_to_delete = versions_in_lambda[::-1][num_revisions:]
             if versions_to_delete:
