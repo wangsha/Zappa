@@ -1,16 +1,21 @@
-import base64
 import logging
 import sys
 from io import BytesIO
 from typing import Optional
 from urllib.parse import unquote, urlencode
 
-from .utilities import ApacheNCSAFormatter, merge_headers, titlecase_keys
-
-BINARY_METHODS = ["POST", "PUT", "PATCH", "DELETE", "CONNECT", "OPTIONS"]
-
+from .utilities import (
+    ApacheNCSAFormatters,
+    extract_request_body,
+    merge_headers,
+    resolve_context_headers,
+)
 
 logger = logging.getLogger(__name__)
+
+# Cache formatter references to avoid factory call per request
+_LOG_FORMATTER = ApacheNCSAFormatters.format_log
+_LOG_FORMATTER_WITH_RT = ApacheNCSAFormatters.format_log_with_response_time
 
 
 def create_wsgi_request(
@@ -20,7 +25,7 @@ def create_wsgi_request(
     trailing_slash=True,
     binary_support=False,
     base_path=None,
-    context_header_mappings={},
+    context_header_mappings=None,
 ):
     """
     Given some event_info via API Gateway,
@@ -31,41 +36,18 @@ def create_wsgi_request(
     else:
         method, headers, path, query_string, remote_user, authorizer = process_lambda_payload_v1(event_info)
 
-    if context_header_mappings:
-        for key, value in context_header_mappings.items():
-            parts = value.split(".")
-            header_val = event_info["requestContext"]
-            for part in parts:
-                if part not in header_val:
-                    header_val = None
-                    break
-                else:
-                    header_val = header_val[part]
-            if header_val is not None:
-                headers[key] = header_val
+    resolve_context_headers(event_info, headers, context_header_mappings)
 
     # Related:  https://github.com/Miserlou/Zappa/issues/677
     #           https://github.com/Miserlou/Zappa/issues/683
     #           https://github.com/Miserlou/Zappa/issues/696
     #           https://github.com/Miserlou/Zappa/issues/836
     #           https://en.wikipedia.org/wiki/Hypertext_Transfer_Protocol#Summary_table
-    if binary_support and (method in BINARY_METHODS):
-        if event_info.get("isBase64Encoded", False):
-            encoded_body = event_info["body"]
-            body = base64.b64decode(encoded_body)
-        else:
-            body = event_info.get("body")
-            if isinstance(body, str):
-                body = body.encode("utf-8")
+    body = extract_request_body(event_info, method, binary_support)
 
-    else:
-        body = event_info.get("body")
-        if isinstance(body, str):
-            body = body.encode("utf-8")
-
-    # Make header names canonical, e.g. content-type => Content-Type
-    # https://github.com/Miserlou/Zappa/issues/1188
-    headers = titlecase_keys(headers)
+    # Headers are already title-cased by process_lambda_payload_v1.
+    # v2 headers arrive lowercase from API Gateway and are used as-is
+    # since the environ loop at the end uppercases them anyway.
 
     if base_path:
         script_name = f"/{base_path}"
@@ -140,7 +122,10 @@ def create_wsgi_request(
 
 def process_lambda_payload_v1(event_info):
     method = event_info.get("httpMethod", None)
-    headers = merge_headers(event_info) or {}  # Allow for the AGW console 'Test' button to work (Pull #735)
+    # Title-case header keys here (e.g. content-type => Content-Type) so
+    # callers don't need a separate titlecase_keys() copy.
+    raw_headers = merge_headers(event_info) or {}  # Allow for the AGW console 'Test' button to work (Pull #735)
+    headers = {k.title(): v for k, v in raw_headers.items()}
     path = unquote(event_info["path"])
     # API Gateway and ALB both started allowing for multi-value querystring
     # params in Nov. 2018. If there aren't multi-value params present, then
@@ -173,9 +158,11 @@ def process_lambda_payload_v2(event_info):
     # See the new format documentation
     # here: https://docs.aws.amazon.com/lambda/latest/dg/urls-invocation.html#urls-payloads
     method = event_info["requestContext"]["http"]["method"]
-    headers = event_info["headers"]
+    # Title-case header keys (v2 headers arrive lowercase from API Gateway)
+    raw_headers = event_info["headers"]
+    headers = {k.title(): v for k, v in raw_headers.items()}
     if event_info.get("cookies"):
-        headers["cookie"] = "; ".join(event_info["cookies"])
+        headers["Cookie"] = "; ".join(event_info["cookies"])
     path = unquote(event_info["rawPath"])
     query = event_info.get("queryStringParameters", {})
     query_string = urlencode(query) if query else ""
@@ -200,19 +187,15 @@ def common_log(environ, response, response_time: Optional[int] = None):
     response_time: response time in micro-seconds
     """
 
-    logger = logging.getLogger(__name__)
-
     if response_time:
-        formatter = ApacheNCSAFormatter(with_response_time=True)
-        log_entry = formatter(
+        log_entry = _LOG_FORMATTER_WITH_RT(
             response.status_code,
             environ,
             len(response.content),
             rt_us=response_time,
         )
     else:
-        formatter = ApacheNCSAFormatter(with_response_time=False)
-        log_entry = formatter(response.status_code, environ, len(response.content))
+        log_entry = _LOG_FORMATTER(response.status_code, environ, len(response.content))
 
     logger.info(log_entry)
 

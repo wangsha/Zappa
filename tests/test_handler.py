@@ -689,3 +689,77 @@ class TestZappa(unittest.TestCase):
         self.assertIn("SCRIPT_NAME='/dev'", response["body"])
         self.assertIn("PATH_INFO='/debug/wsgi/environ'", response["body"])  # FIXED: stage stripped
         self.assertIn("/dev/debug/wsgi/environ", response["body"])  # Correct single prefix!
+
+    def test_wsgi_v2_custom_domain_no_double_stage(self):
+        """
+        Test that API Gateway v2 with a custom domain mapping doesn't double the
+        stage in URLs (#1409). When a custom domain maps to a stage, API Gateway
+        strips the stage from rawPath, so SCRIPT_NAME should be empty.
+        """
+        lh = LambdaHandler("tests.test_wsgi_script_name_settings")
+
+        event = {
+            "version": "2.0",
+            "routeKey": "$default",
+            "rawPath": "/return/request/url",  # Custom domain: stage already stripped
+            "rawQueryString": "",
+            "headers": {
+                "host": "api.example.com",
+            },
+            "requestContext": {
+                "http": {
+                    "method": "GET",
+                    "path": "/return/request/url",
+                },
+                "stage": "dev",  # Stage is still present in requestContext
+                "domainName": "api.example.com",
+            },
+            "isBase64Encoded": False,
+            "body": "",
+        }
+        response = lh.handler(event, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        # With custom domain, stage is NOT in rawPath, so SCRIPT_NAME should be empty
+        # and the URL should NOT contain /dev prefix
+        self.assertEqual(
+            response["body"],
+            "https://api.example.com/return/request/url",
+        )
+
+    def test_wsgi_v2_custom_domain_route_sharing_stage_prefix(self):
+        """
+        Test that a custom-domain route whose top path segment merely shares a
+        leading substring with the stage name (stage "dev" + path "/devices/...")
+        is not mistaken for direct API Gateway access (#1409). The stage must be
+        matched on a path-segment boundary, not a bare string prefix.
+        """
+        lh = LambdaHandler("tests.test_wsgi_script_name_settings")
+
+        event = {
+            "version": "2.0",
+            "routeKey": "$default",
+            "rawPath": "/devices/list",  # Custom domain: stage stripped; starts with "/dev"
+            "rawQueryString": "",
+            "headers": {
+                "host": "api.example.com",
+            },
+            "requestContext": {
+                "http": {
+                    "method": "GET",
+                    "path": "/devices/list",
+                },
+                "stage": "dev",
+                "domainName": "api.example.com",
+            },
+            "isBase64Encoded": False,
+            "body": "",
+        }
+        response = lh.handler(event, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        # The "/dev" stage must NOT be stripped from "/devices/list".
+        self.assertEqual(
+            response["body"],
+            "https://api.example.com/devices/list",
+        )

@@ -14,6 +14,10 @@
 
 
 - [About](#about)
+- [Quick Reference](#quick-reference)
+  - [Minimal Configs](#minimal-configs)
+  - [CLI Commands](#cli-commands)
+  - [Limitations and Constraints](#limitations-and-constraints)
 - [Installation and Configuration](#installation-and-configuration)
   - [Running the Initial Setup / Settings](#running-the-initial-setup--settings)
   - [Alternative: Generating Settings via CLI](#alternative-generating-settings-via-cli)
@@ -22,11 +26,13 @@
   - [Initial Deployments](#initial-deployments)
   - [Updates](#updates)
     - [Docker Workflows](#docker-workflows)
+      - [Settings that should NOT be used with Docker deployments](#settings-that-should-not-be-used-with-docker-deployments)
   - [Rollback](#rollback)
   - [Scheduling](#scheduling)
     - [Advanced Scheduling](#advanced-scheduling)
       - [Multiple Expressions](#multiple-expressions)
       - [Disabled Event](#disabled-event)
+      - [EventBridge Rule Naming](#eventbridge-rule-naming)
   - [Undeploy](#undeploy)
   - [Package](#package)
     - [How Zappa Makes Packages](#how-zappa-makes-packages)
@@ -85,17 +91,26 @@
     - [Notes](#notes)
   - [Unique Package ID](#unique-package-id)
   - [Application Load Balancer Event Source](#application-load-balancer-event-source)
+  - [ASGI Support](#asgi-support)
+    - [Setting Up a FastAPI App](#setting-up-a-fastapi-app)
+    - [The app_type Setting](#the-app_type-setting)
+    - [Starlette Example](#starlette-example)
+    - [Quart Example](#quart-example)
+    - [Binary Support with ASGI](#binary-support-with-asgi)
+    - [ASGI Internals](#asgi-internals)
+    - [ASGI Limitations](#asgi-limitations)
+  - [WebSocket Support](#websocket-support)
+    - [Using Decorators](#using-decorators)
+    - [Using a Base Class](#using-a-base-class)
+    - [Sending Messages to Clients](#sending-messages-to-clients)
+    - [How It Works](#how-it-works)
   - [Endpoint Configuration](#endpoint-configuration)
     - [Example Private API Gateway configuration](#example-private-api-gateway-configuration)
   - [Cold Starts (Experimental)](#cold-starts-experimental)
   - [Lambda Test Console Usage](#lambda-test-console-usage)
     - [`raw_command`](#raw_command)
     - [`manage`](#manage)
-- [Zappa Guides](#zappa-guides)
-- [Zappa in the Press](#zappa-in-the-press)
-- [Sites Using Zappa](#sites-using-zappa)
-- [Related Projects](#related-projects)
-- [Hacks](#hacks)
+- [Community](#community)
 - [Contributing](#contributing)
     - [Using a Local Repo](#using-a-local-repo)
 
@@ -110,9 +125,9 @@
   <i>In a hurry? Click to see <a href="https://htmlpreview.github.io/?https://raw.githubusercontent.com/Miserlou/Talks/master/serverless-sf/big.quickstart.html">(now slightly out-dated) slides from Serverless SF</a>!</i>
 </p>
 
-**Zappa** makes it super easy to build and deploy server-less, event-driven Python applications (including, but not limited to, WSGI web apps) on AWS Lambda + API Gateway. Think of it as "serverless" web hosting for your Python apps. That means **infinite scaling**, **zero downtime**, **zero maintenance** - and at a fraction of the cost of your current deployments!
+**Zappa** builds and deploys server-less, event-driven Python applications (including, but not limited to, WSGI and ASGI web apps) on AWS Lambda + API Gateway. Think of it as "serverless" web hosting for your Python apps. That means **infinite scaling**, **zero downtime**, **zero maintenance** - and at a fraction of the cost of your current deployments!
 
-If you've got a Python web app (including Django and Flask apps), it's as easy as:
+If you've got a Python web app (including Django, Flask, FastAPI, and Starlette apps), it's as easy as:
 
 ```
 $ pip install zappa
@@ -120,7 +135,7 @@ $ zappa init
 $ zappa deploy
 ```
 
-and now you're server-less! _Wow!_
+and now you're server-less!
 
 > What do you mean "serverless"?
 
@@ -128,19 +143,90 @@ Okay, so there still is a server - but it only has a _40 millisecond_ life cycle
 
 With a traditional HTTP server, the server is online 24/7, processing requests one by one as they come in. If the queue of incoming requests grows too large, some requests will time out. With Zappa, **each request is given its own virtual HTTP "server"** by Amazon API Gateway. AWS handles the horizontal scaling automatically, so no requests ever time out. Each request then calls your application from a memory cache in AWS Lambda and returns the response via Python's WSGI interface. After your app returns, the "server" dies.
 
-Better still, with Zappa you only pay for the milliseconds of server time that you use, so it's many **orders of magnitude cheaper** than VPS/PaaS hosts like Linode or Heroku - and in most cases, it's completely free. Plus, there's no need to worry about load balancing or keeping servers online ever again.
+With Zappa you only pay for the milliseconds of server time that you use, so it's many **orders of magnitude cheaper** than VPS/PaaS hosts like Linode or Heroku - and in most cases, it's completely free. Plus, there's no need to worry about load balancing or keeping servers online ever again.
 
-It's great for deploying serverless microservices with frameworks like Flask and Bottle, and for hosting larger web apps and CMSes with Django. Or, you can use any WSGI-compatible app you like! You **probably don't need to change your existing applications** to use it, and you're not locked into using it.
+It's great for deploying serverless microservices with frameworks like Flask and Bottle, and for hosting larger web apps and CMSes with Django. Zappa also supports ASGI frameworks like **FastAPI**, **Starlette**, and **Quart** — deploy async Python apps to Lambda with the same ease. You can use any WSGI or ASGI-compatible app you like! You **probably don't need to change your existing applications** to use it, and you're not locked into using it.
 
-Zappa also lets you build hybrid event-driven applications that can scale to **trillions of events** a year with **no additional effort** on your part! You also get **free SSL certificates**, **global app deployment**, **API access management**, **automatic security policy generation**, **precompiled C-extensions**, **auto keep-warms**, **oversized Lambda packages**, and **many other exclusive features**!
+Zappa also lets you build hybrid event-driven applications with **free SSL certificates**, **global app deployment**, **API access management**, **automatic security policy generation**, **precompiled C-extensions**, **auto keep-warms**, and **oversized Lambda packages**.
 
-And finally, Zappa is **super easy to use**. You can deploy your application with a single command out of the box!
-
-**Awesome!**
 
 <p align="center">
   <img src="http://i.imgur.com/f1PJxCQ.gif" alt="Zappa Demo Gif"/>
 </p>
+
+## Quick Reference
+
+### Minimal Configs
+
+**Flask / Bottle (WSGI):**
+
+```json
+{
+    "dev": {
+        "app_function": "your_module.app",
+        "s3_bucket": "your-s3-bucket"
+    }
+}
+```
+
+**Django:**
+
+```json
+{
+    "dev": {
+        "django_settings": "your_project.settings",
+        "s3_bucket": "your-s3-bucket"
+    }
+}
+```
+
+**FastAPI / Starlette / Quart (ASGI):**
+
+```json
+{
+    "dev": {
+        "app_function": "your_module.app",
+        "app_type": "asgi",
+        "s3_bucket": "your-s3-bucket"
+    }
+}
+```
+
+### CLI Commands
+
+| Command | Description |
+|---|---|
+| `zappa init` | Interactive setup, generates `zappa_settings.json` |
+| `zappa settings --stage <stage>` | Generate settings via CLI (non-interactive) |
+| `zappa deploy <stage>` | First deployment to a stage |
+| `zappa update <stage>` | Push code changes without touching API Gateway routes |
+| `zappa undeploy <stage>` | Remove API Gateway and Lambda function |
+| `zappa rollback <stage> -n <N>` | Roll back N versions |
+| `zappa schedule <stage>` | Register scheduled events and event sources |
+| `zappa unschedule <stage>` | Remove scheduled event rules |
+| `zappa package <stage>` | Build deployment package without deploying |
+| `zappa template <stage>` | Generate API Gateway CloudFormation template |
+| `zappa status <stage>` | Show deployment status and event schedules |
+| `zappa tail <stage>` | Stream CloudWatch logs |
+| `zappa invoke <stage> <func>` | Execute a function remotely |
+| `zappa manage <stage> <cmd>` | Run Django management command |
+| `zappa certify` | Set up SSL certificate for custom domain |
+
+### Limitations and Constraints
+
+| Constraint | Detail |
+|---|---|
+| Python versions | 3.9, 3.10, 3.11, 3.12, 3.13, 3.14 |
+| Package size | 50MB zip limit; use [`slim_handler: true`](#large-projects) for larger projects |
+| Lambda timeout | Default 30s, max 900s; [API Gateway hard-limits at 30s](#application-load-balancer-event-source) (use ALB for longer) |
+| Concurrent executions | AWS default 1000; [request increase](#raising-aws-service-limits) via support ticket |
+| Virtual environment | Zappa must be installed in a venv; venv name must differ from project name |
+| Default IAM policy | Overly permissive; [customize for production](#custom-aws-iam-roles-and-policies-for-execution) |
+| Event function naming | Pattern `^[._A-Za-z0-9]{0,63}$` — [no hyphens allowed](#eventbridge-rule-naming) |
+| Async task args | Must be JSON-serializable, [under 256K](#restrictions) |
+| ASGI limitations | [No WebSocket via ASGI](#asgi-limitations), no lifespan protocol, no streaming responses |
+| Static files | Not designed for static assets; [use S3 + CloudFront](#serving-static-files--binary-uploads) |
+| VPC internet access | Lambda in VPC [requires NAT gateway](#running-tasks-in-a-vpc) for internet access |
 
 ## Installation and Configuration
 
@@ -162,7 +248,7 @@ Next, you'll need to define your local and server-side settings.
 
     $ zappa init
 
-This will automatically detect your application type (Flask/Django - Pyramid users [see here](https://github.com/Miserlou/Zappa/issues/278#issuecomment-241917956)) and help you define your deployment configuration settings. Once you finish initialization, you'll have a file named _zappa_settings.json_ in your project directory defining your basic deployment settings. It will probably look something like this for most WSGI apps:
+This will automatically detect your application type (Flask/Django/FastAPI/Starlette - Pyramid users [see here](https://github.com/Miserlou/Zappa/issues/278#issuecomment-241917956)) and help you define your deployment configuration settings. Once you finish initialization, you'll have a file named _zappa_settings.json_ in your project directory defining your basic deployment settings. It will probably look something like this for most WSGI apps:
 
 ```javascript
 {
@@ -192,6 +278,20 @@ or for Django:
     }
 }
 ```
+
+or for ASGI apps (FastAPI, Starlette, Quart):
+
+```javascript
+{
+    "dev": {
+        "s3_bucket": "lambda",
+        "app_function": "your_module.app",
+        "app_type": "asgi"
+    }
+}
+```
+
+See the [ASGI Support](#asgi-support) section for details.
 
 _Psst: If you're deploying a Django application with Zappa for the first time, you might want to read Edgar Roman's [Django Zappa Guide](https://edgarroman.github.io/zappa-django-guide/)._
 
@@ -292,9 +392,9 @@ Once your settings are configured, you can package and deploy your application t
     Deploying..
     Your application is now live at: https://7k6anj0k99.execute-api.us-east-1.amazonaws.com/production
 
-And now your app is **live!** How cool is that?!
+And now your app is **live!**
 
-To explain what's going on, when you call `deploy`, Zappa will automatically package up your application and local virtual environment into a Lambda-compatible archive, replace any dependencies with versions with wheels compatible with lambda, set up the function handler and necessary WSGI Middleware, upload the archive to S3, create and manage the necessary Amazon IAM policies and roles, register it as a new Lambda function, create a new API Gateway resource, create WSGI-compatible routes for it, link it to the new Lambda function, and finally delete the archive from your S3 bucket. Handy!
+To explain what's going on, when you call `deploy`, Zappa will automatically package up your application and local virtual environment into a Lambda-compatible archive, replace any dependencies with versions with wheels compatible with lambda, set up the function handler and necessary WSGI Middleware, upload the archive to S3, create and manage the necessary Amazon IAM policies and roles, register it as a new Lambda function, create a new API Gateway resource, create WSGI-compatible routes for it, link it to the new Lambda function, and finally delete the archive from your S3 bucket.
 
 Be aware that the default IAM role and policy created for executing Lambda applies a liberal set of permissions.
 These are most likely not appropriate for production deployment of important applications. See the section
@@ -327,6 +427,15 @@ Update Example:
 
 Refer to [the blog post](https://ianwhitestone.work/zappa-serverless-docker/) for more details about how to leverage this functionality, and when you may want to.
 
+##### Settings that should NOT be used with Docker deployments
+
+When deploying with `--docker-image-uri`, the Docker image is responsible for bundling your application code and runtime. A few `zappa_settings` keys only make sense for zip-based deployments and will cause problems if left enabled for a Docker deployment:
+
+- `slim_handler`: This option splits the package into a slim handler and a separate project archive uploaded to S3. When enabled, Zappa writes an `ARCHIVE_PATH` into the generated `zappa_settings.py`, which makes the Lambda handler attempt to download the project archive from S3 at cold start and overlay it on your container's code. With a Docker deployment this either loads stale code from a previous zip deploy, or fails entirely if the archive is missing. **Do not set `slim_handler` for Docker deployments.** See [issue #1341](https://github.com/zappa/Zappa/issues/1341).
+- `runtime`: The Python runtime is determined by the Docker image, so this value is ignored for Docker deployments.
+
+Running `zappa deploy`, `zappa update`, or `zappa save-python-settings-file` with a Docker-targeted configuration will now fail fast when any incompatible setting above is detected. Undeploying a stage that previously used `slim_handler` will also remove the leftover `_current_project.tar.gz` archive from the configured S3 bucket.
+
 If you are using a custom Docker image for your Lambda runtime (e.g. if you want to use a newer version of Python that is not yet supported by Lambda out of the box) and you would like to bypass the Python version check, you can set an environment variable to do so:
 
     $ export ZAPPA_RUNNING_IN_DOCKER=True
@@ -349,7 +458,7 @@ Zappa can be used to easily schedule functions to occur on regular intervals. Th
 These functions will be packaged and deployed along with your `app_function` and called from the handler automatically.
 Just list your functions and the expression to schedule them using [cron or rate syntax](http://docs.aws.amazon.com/lambda/latest/dg/tutorial-scheduled-events-schedule-expressions.html) in your _zappa_settings.json_ file:
 
-**Note:** `function` path cannot exceed 64 characters.
+**Note:** The `function` value must match the pattern `^[._A-Za-z0-9]{0,63}$` — only letters, digits, dots, and underscores are allowed. Hyphens are **not** permitted. See [EventBridge Rule Naming](#eventbridge-rule-naming) for details.
 
 ```javascript
 {
@@ -422,6 +531,50 @@ In this case, you can disable it from running by setting `enabled` to `false` in
     }
 }
 ```
+
+##### EventBridge Rule Naming
+
+Zappa creates [EventBridge](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rules.html) (formerly CloudWatch Events) rules for each scheduled event. The rule name encodes which Python function to execute, so the naming format matters.
+
+**How it works:** The rule name is built as `{lambda_name}-{function}`. When the scheduled event fires, Zappa's handler extracts the function to call by splitting the rule name on `-` and taking the **last segment**:
+
+```python
+whole_function = event["resources"][0].split("/")[-1].split("-")[-1]
+```
+
+For example, with lambda name `my-app-prod` and function `tasks.cleanup`:
+- Rule name: `my-app-prod-tasks.cleanup`
+- Handler extracts: `tasks.cleanup` (last segment after `-`)
+- Zappa imports and executes `tasks.cleanup`
+
+**Restrictions on `function`:**
+
+| Constraint | Value |
+|---|---|
+| Allowed characters | Letters, digits, dots (`.`), underscores (`_`) |
+| Pattern | `^[._A-Za-z0-9]{0,63}$` |
+| Max length | 63 characters |
+| Hyphens | **Forbidden** — would break the `-` split extraction |
+
+If the function were `my-tasks.cleanup`, the handler would extract only `cleanup` (the segment after the last `-`), and the import would fail.
+
+**The rule name must always end with the function path as the last hyphen-delimited segment.** If it doesn't, the handler silently skips execution — the event fires but nothing happens. The `name` setting field inserts a prefix into the rule name but does not change this requirement. The rule name becomes `{lambda_name}-{name}-{function}`, and the handler still extracts `{function}` as the last segment.
+
+```javascript
+{
+    "production": {
+       "events": [{
+           "function": "tasks.cleanup",
+           "name": "nightly",
+           "expression": "cron(0 0 * * ? *)"
+       }]
+    }
+}
+```
+
+Rule name: `my-app-prod-nightly-tasks.cleanup` — handler extracts `tasks.cleanup`.
+
+**Total rule name limit:** EventBridge rule names are capped at 64 characters. If the combined name exceeds this, Zappa automatically shortens the lambda name prefix using a SHA-1 hash. If the function name portion (or `{name}-{function}`) exceeds 63 characters, Zappa raises an error.
 
 ### Undeploy
 
@@ -536,7 +689,7 @@ For instance, suppose you have a basic application in a file called "my_app.py",
 
     $ zappa invoke production my_app.my_function
 
-Any remote print statements made and the value the function returned will then be printed to your local console. **Nifty!**
+Any remote print statements made and the value the function returned will then be printed to your local console.
 
 You can also invoke interpretable Python 3.9/3.10/3.11/3.12/3.13/3.14 strings directly by using `--raw`, like so:
 
@@ -996,6 +1149,7 @@ to change Zappa's behavior. Use these at your own risk!
         },
         "api_key_required": false, // enable securing API Gateway endpoints with x-api-key header (default False)
         "api_key": "your_api_key_id", // optional, use an existing API key. The option "api_key_required" must be true to apply
+        "app_type": "asgi", // optional, set to "asgi" to run an ASGI app (FastAPI, Starlette, Quart). When omitted, Zappa auto-detects async callables or defaults to WSGI.
         "apigateway_enabled": true, // Set to false if you don't want to create an API Gateway resource. Default true.
         "apigateway_description": "My funky application!", // Define a custom description for the API Gateway console. Default None.
         "assume_policy": "my_assume_policy.json", // optional, IAM assume policy JSON file
@@ -1017,6 +1171,15 @@ to change Zappa's behavior. Use these at your own risk!
         // NOTE: Function URLs do NOT include stage names in their paths. Unlike API Gateway v1/v2 which include
         // the stage name in the URL (e.g., /dev/mypath), Function URLs route directly to your app (e.g., /mypath).
         // This means SCRIPT_NAME will be empty for Function URL requests, and PATH_INFO will contain the full path.
+        //
+        // NOTE: When `function_url_enabled` is true with `authorizer: "NONE"`, Zappa attaches TWO
+        // resource-policy statements with `Principal: "*"`: `FunctionURLAllowPublicAccess` for
+        // `lambda:InvokeFunctionUrl` and `FunctionURLAllowPublicAccessInvoke` for `lambda:InvokeFunction`.
+        // Both are required for unsigned calls to succeed; the AWS docs example at
+        // https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html only shows the first statement,
+        // but in practice the URL returns 403 AccessDeniedException without the second (see #1393).
+        // If you are adding a Function URL manually (e.g. outside Zappa) and seeing 403s with NONE
+        // auth, this two-statement shape is the missing piece.
         "apigateway_version": "v1", // optional, API Gateway version to use. Can be "v1" or "v2". Default "v1".
         "architecture": "x86_64", // optional, Set Lambda Architecture, defaults to x86_64. For Graviton 2 use: arm64
         "async_source": "sns", // Source of async tasks. Defaults to "lambda"
@@ -1109,7 +1272,7 @@ to change Zappa's behavior. Use these at your own risk!
         "memory_size": 512, // Lambda function memory in MB. Default 512.
         "ephemeral_storage": { "Size": 512 }, // Lambda function ephemeral_storage size in MB, Default 512, Max 10240
         "efs_config": [{ "Arn": "arn:aws:elasticfilesystem:...:access-point/fsap-...", "LocalMountPath": "/mnt/data" }], // Optional EFS configuration. See EFS section for details.
-        "num_retained_versions":null, // Indicates the number of old versions to retain for the lambda. If absent, keeps all the versions of the function.
+        "num_retained_versions":5, // Number of published Lambda versions to retain. Default 5. Older versions are deleted on `zappa update` to bound code-storage and (when SnapStart is enabled) snapshot-cache cost. Set to `null` to keep all versions.
         "payload_compression": true, // Whether or not to enable API gateway payload compression (default: true)
         "payload_minimum_compression_size": 0, // The threshold size (in bytes) below which payload compression will not be applied (default: 0)
         "prebuild_script": "your_module.your_function", // Function to execute before uploading code
@@ -1136,6 +1299,7 @@ to change Zappa's behavior. Use these at your own risk!
             "SubnetIds": [ "subnet-12345678" ], // Note: not all availability zones support Lambda!
             "SecurityGroupIds": [ "sg-12345678" ]
         },
+        "websocket_handler_module": "your_module.ws_handlers", // Optional, explicit module path for WebSocket handlers. When omitted, Zappa auto-detects modules importing from zappa.websocket.
         "xray_tracing": false // Optional, enable AWS X-Ray tracing on your lambda function.
     }
 }
@@ -1186,7 +1350,7 @@ However, generally Zappa is designed for running your application code, not for 
 
 Your web application framework will likely be able to handle this for you automatically. For Flask, there is [Flask-S3](https://github.com/e-dard/flask-s3), and for Django, there is [Django-Storages](https://django-storages.readthedocs.io/en/latest/).
 
-Similarly, you may want to design your application so that static binary uploads go [directly to S3](http://docs.aws.amazon.com/AWSJavaScriptSDK/guide/browser-examples.html#Uploading_a_local_file_using_the_File_API), which then triggers an event response defined in your `events` setting! That's thinking serverlessly!
+Similarly, you may want to design your application so that static binary uploads go [directly to S3](http://docs.aws.amazon.com/AWSJavaScriptSDK/guide/browser-examples.html#Uploading_a_local_file_using_the_File_API), which then triggers an event response defined in your `events` setting.
 
 ### Enabling CORS
 
@@ -1719,6 +1883,252 @@ More information on using ALB as an event source for Lambda can be found [here](
 
 _An important note_: right now, Zappa will provision ONE lambda to ONE load balancer, which means using `base_path` along with ALB configuration is currently unsupported.
 
+### ASGI Support
+
+Zappa supports ASGI (Asynchronous Server Gateway Interface) applications alongside traditional WSGI apps. This enables deploying async Python frameworks like **FastAPI**, **Starlette**, and **Quart** on AWS Lambda.
+
+ASGI support works with all Lambda event sources: API Gateway v1 (REST API), API Gateway v2 (HTTP API), Application Load Balancer, and Lambda Function URLs.
+
+#### Setting Up a FastAPI App
+
+1. Create your FastAPI application:
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+async def root():
+    return {"message": "Hello from FastAPI on Lambda!"}
+
+@app.get("/items/{item_id}")
+async def read_item(item_id: int):
+    return {"item_id": item_id}
+```
+
+2. Configure `zappa_settings.json`:
+
+```javascript
+{
+    "dev": {
+        "app_function": "your_module.app",
+        "app_type": "asgi",
+        "s3_bucket": "my-zappa-bucket",
+        "runtime": "python3.12"
+    }
+}
+```
+
+3. Deploy:
+
+```
+$ zappa deploy dev
+```
+
+#### The app_type Setting
+
+The `app_type` setting tells Zappa how to handle your application:
+
+- **`"asgi"`** — Run through the ASGI handler. Use this for FastAPI, Starlette, Quart, or any ASGI-compatible application.
+- **Omitted / not set** — Zappa auto-detects: if your `app_function` is an async callable with the ASGI signature `(scope, receive, send)`, Zappa treats it as ASGI automatically. Otherwise, it falls back to WSGI.
+
+Setting `app_type` to `"asgi"` explicitly is recommended. Auto-detection works for simple cases, but explicit configuration avoids ambiguity.
+
+#### Starlette Example
+
+```python
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+async def homepage(request):
+    return JSONResponse({"message": "Hello from Starlette!"})
+
+app = Starlette(routes=[Route("/", homepage)])
+```
+
+```javascript
+{
+    "dev": {
+        "app_function": "your_module.app",
+        "app_type": "asgi",
+        "s3_bucket": "my-zappa-bucket"
+    }
+}
+```
+
+#### Quart Example
+
+```python
+from quart import Quart, jsonify
+
+app = Quart(__name__)
+
+@app.route("/")
+async def hello():
+    return await jsonify(message="Hello from Quart!")
+```
+
+```javascript
+{
+    "dev": {
+        "app_function": "your_module.app",
+        "app_type": "asgi",
+        "s3_bucket": "my-zappa-bucket"
+    }
+}
+```
+
+#### Binary Support with ASGI
+
+Binary support works the same as with WSGI apps. When `binary_support` is `true`, Zappa base64-encodes responses that have:
+
+- A `Content-Encoding` header (gzip, br, deflate, etc.)
+- A MIME type that is not text-based (e.g., `application/octet-stream`, `image/png`)
+
+Text-based responses (`text/*`, `application/json`, `application/xml`, etc.) are returned as plain text even with `binary_support` enabled.
+
+#### ASGI Internals
+
+On each Lambda invocation, Zappa:
+
+1. Converts the Lambda event (API Gateway v1/v2, ALB, or Function URL) into an ASGI scope dict
+2. Wraps the request body in an ASGI `receive` callable
+3. Runs your async application inside an `asyncio` event loop via the `ASGIHandler` bridge
+4. Collects the response status, headers, and body from ASGI `send()` calls
+5. Formats the response for API Gateway / ALB / Function URL
+
+No additional dependencies are required — `asyncio` is part of the Python standard library.
+
+#### ASGI Limitations
+
+- **WebSocket** connections are not supported through the ASGI handler. Use the [WebSocket Support](#websocket-support) feature for WebSocket APIs.
+- **ASGI Lifespan** protocol (startup/shutdown events) is not implemented. Lambda functions are short-lived, so per-request lifespan events would add overhead without benefit.
+- **Streaming responses** are collected in memory before returning. Lambda does not support streaming HTTP responses via API Gateway.
+
+### WebSocket Support
+
+Zappa supports [API Gateway WebSocket APIs](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-websocket-api.html), enabling persistent WebSocket connections handled by Lambda. WebSocket support is auto-detected when your project imports from `zappa.websocket` — no settings changes required.
+
+#### Using Decorators
+
+```python
+import json
+import logging
+
+from flask import Flask
+from zappa.websocket import on_connect, on_disconnect, on_message, send_message
+
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    return {"status": "ok"}
+
+
+@on_connect
+def handle_connect(event, context):
+    connection_id = event["requestContext"]["connectionId"]
+    logger.info("Client connected: %s", connection_id)
+    return {"statusCode": 200}
+
+
+@on_disconnect
+def handle_disconnect(event, context):
+    connection_id = event["requestContext"]["connectionId"]
+    logger.info("Client disconnected: %s", connection_id)
+    return {"statusCode": 200}
+
+
+@on_message
+def handle_message(event, context):
+    body = event.get("body", "{}")
+    data = json.loads(body)
+    # Echo the message back to the sender
+    connection_id = event["requestContext"]["connectionId"]
+    send_message(connection_id, {"echo": data})
+    return {"statusCode": 200}
+```
+
+#### Using a Base Class
+
+```python
+import json
+import logging
+
+from flask import Flask
+from zappa.websocket import ZappaWebSocketServer, send_message
+
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    return {"status": "ok"}
+
+
+class MyWebSocket(ZappaWebSocketServer):
+    def on_connect(self, event, context):
+        connection_id = event["requestContext"]["connectionId"]
+        logger.info("Client connected: %s", connection_id)
+        return {"statusCode": 200}
+
+    def on_message(self, event, context):
+        connection_id = event["requestContext"]["connectionId"]
+        data = json.loads(event.get("body", "{}"))
+        send_message(connection_id, {"echo": data})
+        return {"statusCode": 200}
+
+    # on_disconnect is optional — only overridden methods are registered
+```
+
+Both examples are complete `app.py` files. The `@on_connect` and `@on_message` handlers (or `on_connect`/`on_message` methods) are required; `@on_disconnect` is optional.
+
+#### Sending Messages to Clients
+
+Use `send_message(connection_id, data)` to send a message to any connected client by its connection ID. The Zappa handler automatically sets the `REQUEST_DOMAIN_NAME` and `STAGE` environment variables, so no endpoint configuration is needed.
+
+The `data` argument accepts three types:
+- **`dict`** — JSON-encoded to a UTF-8 byte string
+- **`str`** — encoded as UTF-8 bytes
+- **`bytes`** — sent as-is (raw binary)
+
+```python
+from zappa.websocket import send_message
+
+connection_id = event["requestContext"]["connectionId"]
+send_message(connection_id, {"type": "notification", "text": "Hello!"})
+send_message(connection_id, "raw string payload")
+
+send_message(other_connection_id, {"type": "broadcast", "text": "Hi everyone!"})
+```
+
+#### How It Works
+
+- On `zappa deploy` or `zappa update`, Zappa scans your project for `from zappa.websocket import ...` statements
+- When detected, the module path is saved into the Lambda package so your handlers are imported at runtime
+- A WebSocket API Gateway is provisioned alongside your REST/HTTP API via CloudFormation
+- The WebSocket URL (`wss://...`) is printed after deployment
+- Incoming WebSocket events (`CONNECT`, `DISCONNECT`, `MESSAGE`) are routed to your registered handlers
+- CloudFormation manages the full lifecycle — `zappa undeploy` cleans up all WebSocket resources
+
+If auto-detection doesn't find your handlers (e.g. dynamic imports or unconventional project layouts), set the module path explicitly:
+
+```json
+{
+    "dev": {
+        "app_function": "your_module.app",
+        "websocket_handler_module": "your_module.ws_handlers"
+    }
+}
+```
+
 ### Endpoint Configuration
 
 API Gateway can be configured to be only accessible in a VPC. To enable this; [configure your VPC to support](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-private-apis.html) then set the `endpoint_configuration` to `PRIVATE` and set up Resource Policy on the API Gateway. A note about this; if you're using a private endpoint, Zappa won't be able to tell if the API is returning a successful status code upon deploy or update, so you'll have to check it manually to ensure your setup is working properly.
@@ -1803,83 +2213,9 @@ Example:
 }
 ```
 
-## Zappa Guides
+## Community
 
-- [Django-Zappa tutorial (screencast)](https://www.youtube.com/watch?v=plUrbPN0xc8&feature=youtu.be).
-- [Using Django-Zappa, Part 1](https://serverlesscode.com/post/zappa-wsgi-for-python/).
-- [Using Django-Zappa, Part 2: VPCs](https://serverlesscode.com/post/zappa-wsgi-for-python-pt-2/).
-- [Building Serverless Microservices with Zappa and Flask](https://gun.io/blog/serverless-microservices-with-zappa-and-flask/)
-- [Zappa で Hello World するまで (Japanese)](http://qiita.com/satoshi_iwashita/items/505492193317819772c7)
-- [How to Deploy Zappa with CloudFront, RDS and VPC](https://jinwright.net/how-deploy-serverless-wsgi-app-using-zappa/)
-- [Secure 'Serverless' File Uploads with AWS Lambda, S3, and Zappa](http://blog.stratospark.com/secure-serverless-file-uploads-with-aws-lambda-s3-zappa.html)
-- [Deploy a Serverless WSGI App using Zappa, CloudFront, RDS, and VPC](https://docs.google.com/presentation/d/1aYeOMgQl4V_fFgT5VNoycdXtob1v6xVUWlyxoTEiTw0/edit#slide=id.p)
-- [AWS: Deploy Alexa Ask Skills with Flask-Ask and Zappa](https://developer.amazon.com/blogs/post/8e8ad73a-99e9-4c0f-a7b3-60f92287b0bf/New-Alexa-Tutorial-Deploy-Flask-Ask-Skills-to-AWS-Lambda-with-Zappa)
-- [Guide to using Django with Zappa](https://edgarroman.github.io/zappa-django-guide/)
-- [Zappa and LambCI](https://seancoates.com/blogs/zappa-and-lambci/)
-- [Building A Serverless Image Processing SaaS using Zappa](https://medium.com/99serverless/building-a-serverless-image-processing-saas-9ef68b594076)
-- [Serverless Slack Slash Commands with Python and Zappa](https://renzo.lucioni.xyz/serverless-slash-commands-with-python/)
-- [Bringing Tokusatsu to AWS using Python, Flask, Zappa and Contentful](https://www.contentful.com/blog/2018/03/07/bringing-tokusatsu-to-aws-using-python-flask-zappa-and-contentful/)
-- [AWS Summit 2018 Seoul - Zappa와 함께하는 Serverless Microservice](https://www.slideshare.net/YunSeopSong/zappa-serverless-microservice-94410308/)
-- [Book - Building Serverless Python Web Services with Zappa](https://github.com/PacktPublishing/Building-Serverless-Python-Web-Services-with-Zappa)
-- [Vider sa flask dans une lambda](http://free_zed.gitlab.io/articles/2019/11/vider-sa-flask-dans-une-lambda/)[French]
-- _Your guide here?_
-
-## Zappa in the Press
-
-- _[Zappa Serves Python, Minus the Servers](http://www.infoworld.com/article/3031665/application-development/zappa-serves-python-web-apps-minus-the-servers.html)_
-- _[Zappa lyfter serverlösa applikationer med Python](http://computersweden.idg.se/2.2683/1.649895/zappa-lyfter-python)_
-- _[Interview: Rich Jones on Zappa](https://serverlesscode.com/post/rich-jones-interview-django-zappa/)_
-- [Top 10 Python Libraries of 2016](https://tryolabs.com/blog/2016/12/20/top-10-python-libraries-of-2016/)
-
-## Sites Using Zappa
-
-- [Mailchimp Signup Utility](https://github.com/sasha42/Mailchimp-utility) - A microservice for adding people to a mailing list via API.
-- [Zappa Slack Inviter](https://github.com/Miserlou/zappa-slack-inviter) - A tiny, server-less service for inviting new users to your Slack channel.
-- [Serverless Image Host](https://github.com/Miserlou/serverless-imagehost) - A thumbnailing service with Flask, Zappa and Pillow.
-- [Zappa BitTorrent Tracker](https://github.com/Miserlou/zappa-bittorrent-tracker) - An experimental server-less BitTorrent tracker. Work in progress.
-- [JankyGlance](https://github.com/Miserlou/JankyGlance) - A server-less Yahoo! Pipes replacement.
-- [LambdaMailer](https://github.com/tryolabs/lambda-mailer) - A server-less endpoint for processing a contact form.
-- [Voter Registration Microservice](https://topics.arlingtonva.us/2016/11/voter-registration-search-microservice/) - Official backup to to the Virginia Department of Elections portal.
-- [FreePoll Online](https://www.freepoll.online) - A simple and awesome say for groups to make decisions.
-- [PasteOfCode](https://paste.ofcode.org/) - A Zappa-powered paste bin.
-- And many more, including banks, governments, startups, enterprises and schools!
-
-Are you using Zappa? Let us know and we'll list your site here!
-
-## Related Projects
-
-- [Mackenzie](http://github.com/Miserlou/Mackenzie) - AWS Lambda Infection Toolkit
-- [NoDB](https://github.com/Miserlou/NoDB) - A simple, server-less, Pythonic object store based on S3.
-- [zappa-cms](http://github.com/Miserlou/zappa-cms) - A tiny server-less CMS for busy hackers. Work in progress.
-- [zappa-django-utils](https://github.com/Miserlou/zappa-django-utils) - Utility commands to help Django deployments.
-- [flask-ask](https://github.com/johnwheeler/flask-ask) - A framework for building Amazon Alexa applications. Uses Zappa for deployments.
-- [zappa-file-widget](https://github.com/anush0247/zappa-file-widget) - A Django plugin for supporting binary file uploads in Django on Zappa.
-- [zops](https://github.com/bjinwright/zops) - Utilities for teams and continuous integrations using Zappa.
-- [cookiecutter-mobile-backend](https://github.com/narfman0/cookiecutter-mobile-backend/) - A `cookiecutter` Django project with Zappa and S3 uploads support.
-- [zappa-examples](https://github.com/narfman0/zappa-examples/) - Flask, Django, image uploads, and more!
-- [zappa-hug-example](https://github.com/mcrowson/zappa-hug-example) - Example of a Hug application using Zappa.
-- [Zappa Docker Image](https://github.com/danielwhatmuff/zappa) - A Docker image for running Zappa locally, based on Lambda Docker.
-- [zappa-dashing](https://github.com/nikos/zappa-dashing) - Monitor your AWS environment (health/metrics) with Zappa and CloudWatch.
-- [s3env](https://github.com/cameronmaske/s3env) - Manipulate a remote Zappa environment variable key/value JSON object file in an S3 bucket through the CLI.
-- [zappa_resize_image_on_fly](https://github.com/wobeng/zappa_resize_image_on_fly) - Resize images on the fly using Flask, Zappa, Pillow, and OpenCV-python.
-- [zappa-ffmpeg](https://github.com/ubergarm/zappa-ffmpeg) - Run ffmpeg inside a lambda for serverless transformations.
-- [gdrive-lambda](https://github.com/richiverse/gdrive-lambda) - pass json data to a csv file for end users who use Gdrive across the organization.
-- [travis-build-repeat](https://github.com/bcongdon/travis-build-repeat) - Repeat TravisCI builds to avoid stale test results.
-- [wunderskill-alexa-skill](https://github.com/mcrowson/wunderlist-alexa-skill) - An Alexa skill for adding to a Wunderlist.
-- [xrayvision](https://github.com/mathom/xrayvision) - Utilities and wrappers for using AWS X-Ray with Zappa.
-- [terraform-aws-zappa](https://github.com/dpetzold/terraform-aws-zappa) - Terraform modules for creating a VPC, RDS instance, ElastiCache Redis and CloudFront Distribution for use with Zappa.
-- [zappa-sentry](https://github.com/jneves/zappa-sentry) - Integration with Zappa and Sentry
-- [IOpipe](https://github.com/iopipe/iopipe-python#zappa) - Monitor, profile and analyze your Zappa apps.
-
-## Hacks
-
-Zappa goes quite far beyond what Lambda and API Gateway were ever intended to handle. As a result, there are quite a few hacks in here that allow it to work. Some of those include, but aren't limited to..
-
-- Using VTL to map body, headers, method, params and query strings into JSON, and then turning that into valid WSGI.
-- Attaching response codes to response bodies, Base64 encoding the whole thing, using that as a regex to route the response code, decoding the body in VTL, and mapping the response body to that.
-- Packing and _Base58_ encoding multiple cookies into a single cookie because we can only map one kind.
-- Forcing the case permutations of "Set-Cookie" in order to return multiple headers at the same time.
-- Turning cookie-setting 301/302 responses into 200 responses with HTML redirects, because we have no way to set headers on redirects.
+For guides, press coverage, sites using Zappa, related projects, and implementation details, see [Community & Resources](docs/community.md).
 
 ## Contributing
 

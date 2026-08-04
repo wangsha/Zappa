@@ -335,6 +335,24 @@ class TestZappa(unittest.TestCase):
         cached_pypi_info_dir = os.path.join(tempfile.gettempdir(), "cached_pypi_info")
         os.remove(os.path.join(cached_pypi_info_dir, "markupsafe-2.1.3.json"))
 
+    def test_exclude_glob_recursive_pattern(self):
+        """Test that exclude_glob correctly handles ** recursive patterns (#1269)."""
+        mock_installed_packages = {}
+        with mock.patch(
+            "zappa.core.Zappa.get_installed_packages",
+            return_value=mock_installed_packages,
+        ):
+            z = Zappa(runtime="python3.11")
+            path = z.create_lambda_zip(
+                handler_file=os.path.realpath(__file__),
+                exclude_glob=["**/*.pyc"],
+            )
+            with zipfile.ZipFile(path, "r") as zf:
+                names = zf.namelist()
+                pyc_files = [n for n in names if n.endswith(".pyc")]
+                self.assertEqual(pyc_files, [], f"Expected no .pyc files in zip but found: {pyc_files}")
+            os.remove(path)
+
     def test_get_exclude_glob__file_not_deleted(self):
         z = Zappa(runtime="python3.11")
         self.assertIsNotNone(z.get_cached_manylinux_wheel("psycopg2-binary", "2.9.7"))
@@ -938,21 +956,119 @@ class TestZappa(unittest.TestCase):
         zappa_cli.load_settings("tests/test_settings.yaml")
         self.assertEqual("None", zappa_cli.snap_start)
 
-    def test_capacity_provider_configuration(self):
+    @mock.patch("botocore.client")
+    def test_snap_start_passed_to_create_lambda_function(self, client):
         """
-        Test that capacity provider configuration is loaded from settings.
+        Test that snap_start is passed to create_lambda_function during deploy.
+        Regression test for https://github.com/zappa/Zappa/issues/1447
         """
-        zappa_cli = ZappaCLI()
-        zappa_cli.api_stage = "capacity_provider_enabled"
-        zappa_cli.load_settings("tests/test_settings.yaml")
-        expected_config = {
-            "LambdaManagedInstancesCapacityProviderConfig": {
-                "CapacityProviderArn": "arn:aws:lambda:us-east-1:123456789012:capacity-provider/zappa-test",
-                "PerExecutionEnvironmentMaxConcurrency": 5,
-                "ExecutionEnvironmentMemoryGiBPerVCpu": 2.0,
-            }
+        boto_mock = mock.MagicMock()
+        zappa_core = Zappa(
+            boto_session=boto_mock,
+            profile_name="test",
+            aws_region="test",
+            load_credentials=True,
+        )
+        zappa_core.lambda_client.create_function.return_value = {
+            "FunctionArn": "abc",
+            "Version": 1,
         }
-        self.assertEqual(expected_config, zappa_cli.capacity_provider_config)
+        zappa_core.create_lambda_function(snap_start="PublishedVersions")
+        create_call_kwargs = zappa_core.lambda_client.create_function.call_args[1]
+        self.assertEqual(create_call_kwargs["SnapStart"], {"ApplyOn": "PublishedVersions"})
+
+    def test_snap_start_publishes_version_after_config_update(self):
+        """
+        Test that update_lambda_configuration publishes a new version when
+        snap_start is enabled, so SnapStart creates a snapshot.
+        Regression test for https://github.com/zappa/Zappa/issues/1448
+        """
+        z = Zappa()
+        z.credentials_arn = object()
+
+        with mock.patch.object(z, "lambda_client") as mock_client:
+            mock_client.get_function_configuration.return_value = {"PackageType": "Zip"}
+            mock_client.update_function_configuration.return_value = {
+                "FunctionArn": "arn:aws:lambda:us-east-1:123:function:test",
+            }
+            mock_client.publish_version.return_value = {
+                "FunctionArn": "arn:aws:lambda:us-east-1:123:function:test:2",
+                "Version": "2",
+            }
+            # ALB alias does not exist
+            mock_client.get_alias.side_effect = botocore.exceptions.ClientError(
+                {"Error": {"Code": "ResourceNotFoundException", "Message": ""}},
+                "GetAlias",
+            )
+
+            z.update_lambda_configuration(
+                "arn:aws:lambda:us-east-1:123:function:test",
+                "test",
+                "handler.lambda_handler",
+                snap_start="PublishedVersions",
+            )
+
+            mock_client.publish_version.assert_called_once_with(FunctionName="test")
+
+    def test_snap_start_disabled_does_not_publish_extra_version(self):
+        """
+        Test that update_lambda_configuration does NOT publish an extra version
+        when snap_start is disabled.
+        """
+        z = Zappa()
+        z.credentials_arn = object()
+
+        with mock.patch.object(z, "lambda_client") as mock_client:
+            mock_client.get_function_configuration.return_value = {"PackageType": "Zip"}
+            mock_client.update_function_configuration.return_value = {
+                "FunctionArn": "arn:aws:lambda:us-east-1:123:function:test",
+            }
+
+            z.update_lambda_configuration(
+                "arn:aws:lambda:us-east-1:123:function:test",
+                "test",
+                "handler.lambda_handler",
+                snap_start=None,
+            )
+
+            mock_client.publish_version.assert_not_called()
+
+    def test_snap_start_updates_alb_alias_after_publish(self):
+        """
+        Test that when snap_start publishes a new version, the ALB alias
+        is updated to point to the new version.
+        """
+        z = Zappa()
+        z.credentials_arn = object()
+
+        with mock.patch.object(z, "lambda_client") as mock_client:
+            mock_client.get_function_configuration.return_value = {"PackageType": "Zip"}
+            mock_client.update_function_configuration.return_value = {
+                "FunctionArn": "arn:aws:lambda:us-east-1:123:function:test",
+            }
+            mock_client.publish_version.return_value = {
+                "FunctionArn": "arn:aws:lambda:us-east-1:123:function:test:3",
+                "Version": "3",
+            }
+            # ALB alias exists
+            mock_client.get_alias.return_value = {
+                "AliasArn": "arn:aws:lambda:us-east-1:123:function:test:current-alb-version",
+                "Name": "current-alb-version",
+                "FunctionVersion": "1",
+            }
+
+            z.update_lambda_configuration(
+                "arn:aws:lambda:us-east-1:123:function:test",
+                "test",
+                "handler.lambda_handler",
+                snap_start="PublishedVersions",
+            )
+
+            mock_client.update_alias.assert_called_once_with(
+                FunctionName="test",
+                FunctionVersion="3",
+                Name="current-alb-version",
+            )
 
     def test_update_empty_aws_env_hash(self):
         z = Zappa()
@@ -1676,6 +1792,61 @@ class TestZappa(unittest.TestCase):
             finally:
                 os.chdir(current_dir)
 
+    def test_zappa_init_django_excludes_app_function(self):
+        """
+        Regression test for https://github.com/zappa/Zappa/issues/1404
+        Django projects should have django_settings but NOT app_function
+        in the generated zappa_settings.json.
+        """
+        current_dir = os.getcwd()
+        with tempfile.TemporaryDirectory(prefix="zappa_test") as tempdir:
+            try:
+                os.chdir(tempdir)
+                tempdir = Path(tempdir)
+
+                settings_filepath = tempdir / "zappa_settings.json"
+
+                zappa_cli = ZappaCLI()
+
+                # Mock Django as importable so has_django=True
+                django_mock = mock.MagicMock()
+                with mock.patch.dict("sys.modules", {"django": django_mock}), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_env", return_value="dev"
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_profile",
+                    return_value=("default", {"region": "us-east-1"}),
+                ), mock.patch(
+                    "zappa.cli.detect_django_settings",
+                    return_value=["my_project.settings"],
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_django_settings",
+                    return_value="my_project.settings",
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_bucket",
+                    return_value="my-zappa-bucket",
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_global_settings",
+                    return_value=["n", False],
+                ), mock.patch(
+                    "zappa.cli.ZappaCLI._get_init_confirm", return_value="y"
+                ):
+                    zappa_cli.init()
+
+                self.assertTrue(settings_filepath.exists())
+
+                with settings_filepath.open("r") as f:
+                    zappa_settings = json.load(f)
+
+                dev_settings = zappa_settings["dev"]
+                self.assertEqual(dev_settings["django_settings"], "my_project.settings")
+                self.assertNotIn(
+                    "app_function",
+                    dev_settings,
+                    "Django projects must not have app_function in settings (issue #1404)",
+                )
+            finally:
+                os.chdir(current_dir)
+
     def test_cli_sanity(self):
         zappa_cli = ZappaCLI()
         return
@@ -1703,6 +1874,8 @@ class TestZappa(unittest.TestCase):
             self.assertIn("dev", settings)
             self.assertEqual(settings["dev"]["app_function"], "app.app")
             self.assertEqual(settings["dev"]["aws_region"], "us-east-1")
+            # Generated settings should include num_retained_versions default
+            self.assertEqual(settings["dev"]["num_retained_versions"], 5)
 
             # Test settings command with custom stage (no ZAPPA_* env vars)
             with redirect_stdout(io.StringIO()) as f:
@@ -2179,6 +2352,43 @@ class TestZappa(unittest.TestCase):
             zappa_cli.load_settings("test_settings.json")
         self.assertIn("not unique", str(context.exception))
 
+    def test_load_settings__num_retained_versions_default(self):
+        """Default num_retained_versions is 5 when not set in zappa_settings.json."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "num_retained_versions_default"
+        zappa_cli.load_settings("test_settings.json")
+        self.assertEqual(5, zappa_cli.num_retained_versions)
+
+    def test_load_settings__num_retained_versions_null(self):
+        """num_retained_versions: null preserves the opt-out (keep all versions)."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "num_retained_versions_null"
+        zappa_cli.load_settings("test_settings.json")
+        self.assertIsNone(zappa_cli.num_retained_versions)
+
+    def test_load_settings__num_retained_versions_explicit(self):
+        """An explicit integer value overrides the default."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "num_retained_versions_explicit"
+        zappa_cli.load_settings("test_settings.json")
+        self.assertEqual(10, zappa_cli.num_retained_versions)
+
+    def test_load_settings__num_retained_versions_invalid_type(self):
+        """A non-int, non-null value raises ClickException."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "num_retained_versions_invalid_type"
+        with self.assertRaises(ClickException) as context:
+            zappa_cli.load_settings("test_settings.json")
+        self.assertIn("num_retained_versions", str(context.exception))
+
+    def test_load_settings__num_retained_versions_invalid_value(self):
+        """A value less than 1 raises ClickException."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "num_retained_versions_invalid_value"
+        with self.assertRaises(ClickException) as context:
+            zappa_cli.load_settings("test_settings.json")
+        self.assertIn("greater than 0", str(context.exception))
+
     def test_load_settings_yml(self):
         zappa_cli = ZappaCLI()
         zappa_cli.api_stage = "ttt888"
@@ -2443,6 +2653,95 @@ class TestZappa(unittest.TestCase):
 
         colorized_string = zappa_cli.colorize_invoke_command(plain_string)
         self.assertEqual(final_string, colorized_string)
+
+    @mock.patch("zappa.cli.ZappaCLI.format_lambda_response")
+    @mock.patch("zappa.core.Zappa.invoke_lambda_function")
+    def test_invoke_with_payload(self, mock_invoke, mock_format):
+        """Test that --payload merges JSON into the invoke event."""
+        mock_invoke.return_value = {"StatusCode": 200}
+        mock_format.return_value = "ok"
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+        zappa_cli.zappa.invoke_lambda_function = mock_invoke
+
+        zappa_cli.invoke(
+            "my_app.my_function",
+            payload='{"key1": "value1", "key2": "value2"}',
+        )
+
+        call_args = mock_invoke.call_args
+        sent_payload = json.loads(call_args[0][1])
+        self.assertEqual(sent_payload["command"], "my_app.my_function")
+        self.assertEqual(sent_payload["key1"], "value1")
+        self.assertEqual(sent_payload["key2"], "value2")
+
+    @mock.patch("zappa.cli.ZappaCLI.format_lambda_response")
+    @mock.patch("zappa.core.Zappa.invoke_lambda_function")
+    def test_invoke_with_payload_raw_python(self, mock_invoke, mock_format):
+        """Test that --payload works with --raw."""
+        mock_invoke.return_value = {"StatusCode": 200}
+        mock_format.return_value = "ok"
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+        zappa_cli.zappa.invoke_lambda_function = mock_invoke
+
+        zappa_cli.invoke(
+            "print('hello')",
+            raw_python=True,
+            payload='{"extra": "data"}',
+        )
+
+        call_args = mock_invoke.call_args
+        sent_payload = json.loads(call_args[0][1])
+        self.assertEqual(sent_payload["raw_command"], "print('hello')")
+        self.assertEqual(sent_payload["extra"], "data")
+
+    def test_invoke_with_invalid_payload_json(self):
+        """Test that invalid JSON in --payload raises ClickException."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+
+        with self.assertRaises(ClickException) as cm:
+            zappa_cli.invoke("my_app.my_function", payload="not-valid-json")
+        self.assertIn("--payload must be valid JSON", str(cm.exception))
+
+    def test_invoke_with_non_dict_payload(self):
+        """Test that a non-dict JSON payload raises ClickException."""
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+
+        with self.assertRaises(ClickException) as cm:
+            zappa_cli.invoke("my_app.my_function", payload='["a", "b"]')
+        self.assertIn("--payload must be a JSON object", str(cm.exception))
+
+    @mock.patch("zappa.cli.ZappaCLI.format_lambda_response")
+    @mock.patch("zappa.core.Zappa.invoke_lambda_function")
+    def test_invoke_without_payload(self, mock_invoke, mock_format):
+        """Test that invoke without --payload works as before."""
+        mock_invoke.return_value = {"StatusCode": 200}
+        mock_format.return_value = "ok"
+
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "dev"
+        zappa_cli.lambda_name = "test-func"
+        zappa_cli.zappa = mock.MagicMock()
+        zappa_cli.zappa.invoke_lambda_function = mock_invoke
+
+        zappa_cli.invoke("my_app.my_function")
+
+        call_args = mock_invoke.call_args
+        sent_payload = json.loads(call_args[0][1])
+        self.assertEqual(sent_payload, {"command": "my_app.my_function"})
 
     @mock.patch("zappa.cli.ZappaCLI.colorize_invoke_command")
     @mock.patch("zappa.cli.ZappaCLI.format_invoke_command")
@@ -3213,6 +3512,69 @@ class TestZappa(unittest.TestCase):
         self.assertTrue(os.path.isfile(zappa_cli.zip_path))
 
         zappa_cli.remove_local_zip()
+
+    def test_docker_deploy_rejects_slim_handler(self):
+        # Issue #1341: slim_handler + Docker produces a stale ARCHIVE_PATH in
+        # the generated zappa_settings.py, so deploy must fail fast.
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "slim_handler"
+        zappa_cli.load_settings("test_settings.json")
+        with self.assertRaises(ClickException) as exc_ctx:
+            zappa_cli.deploy(docker_image_uri="1234.dkr.ecr.us-east-1.amazonaws.com/repo:latest")
+        self.assertIn("slim_handler", str(exc_ctx.exception.message))
+
+    def test_docker_update_rejects_slim_handler(self):
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "slim_handler"
+        zappa_cli.load_settings("test_settings.json")
+        with self.assertRaises(ClickException) as exc_ctx:
+            zappa_cli.update(docker_image_uri="1234.dkr.ecr.us-east-1.amazonaws.com/repo:latest")
+        self.assertIn("slim_handler", str(exc_ctx.exception.message))
+
+    def test_save_python_settings_file_rejects_slim_handler(self):
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "slim_handler"
+        zappa_cli.load_settings("test_settings.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "zappa_settings.py")
+            with self.assertRaises(ClickException) as exc_ctx:
+                zappa_cli.save_python_settings_file(out)
+            self.assertIn("slim_handler", str(exc_ctx.exception.message))
+            self.assertFalse(os.path.exists(out))
+
+    def test_docker_deploy_ok_without_slim_handler(self):
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "ttt888"
+        zappa_cli.load_settings("test_settings.json")
+        self.assertFalse(zappa_cli.stage_config.get("slim_handler"))
+        zappa_cli._check_docker_settings_conflicts()
+
+    def test_undeploy_removes_slim_handler_archive(self):
+        # Issue #1341: undeploy must clean up the S3 project archive so a
+        # later redeploy does not load stale code.
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "slim_handler"
+        zappa_cli.load_settings("test_settings.json")
+        zappa_cli.zappa = mock.MagicMock()
+        zappa_cli.use_alb = False
+        zappa_cli.use_apigateway = False
+
+        zappa_cli.undeploy(no_confirm=True)
+
+        expected_key = "{0}_{1}_current_project.tar.gz".format(zappa_cli.api_stage, zappa_cli.project_name)
+        zappa_cli.zappa.remove_from_s3.assert_called_once_with(expected_key, zappa_cli.s3_bucket_name)
+
+    def test_undeploy_skips_archive_cleanup_without_slim_handler(self):
+        zappa_cli = ZappaCLI()
+        zappa_cli.api_stage = "ttt888"
+        zappa_cli.load_settings("test_settings.json")
+        zappa_cli.zappa = mock.MagicMock()
+        zappa_cli.use_alb = False
+        zappa_cli.use_apigateway = False
+
+        zappa_cli.undeploy(no_confirm=True)
+
+        zappa_cli.zappa.remove_from_s3.assert_not_called()
 
     def test_settings_py_generation(self):
         zappa_cli = ZappaCLI()
@@ -4071,6 +4433,39 @@ class TestZappa(unittest.TestCase):
         boto_mock.client().create_function_url_config.assert_not_called()
         boto_mock.client().update_function_url_config.assert_not_called()
 
+    @mock.patch("botocore.client")
+    def test_delete_lambda_function_url_unsupported_region(self, client):
+        """In regions where Lambda Function URLs are not supported,
+        list_function_url_configs raises ClientError. delete_lambda_function_url
+        should catch it and return early without attempting any deletes."""
+        boto_mock = mock.MagicMock()
+        zappa_core = Zappa(
+            boto_session=boto_mock,
+            profile_name="test",
+            aws_region="eu-south-2",
+            load_credentials=True,
+        )
+        function_name = "abc"
+        function_arn = "arn:aws:lambda:eu-south-2:123456789:function:{}".format(function_name)
+
+        error_response = {
+            "Error": {
+                "Code": "AccessDeniedException",
+                "Message": "User is not authorized to perform: lambda:ListFunctionUrlConfigs",
+            }
+        }
+        zappa_core.lambda_client.list_function_url_configs.side_effect = botocore.exceptions.ClientError(
+            error_response, "ListFunctionUrlConfigs"
+        )
+
+        # Should not raise — returns early
+        zappa_core.delete_lambda_function_url(function_name=function_arn)
+
+        # Verify no delete or policy operations were attempted
+        boto_mock.client().delete_function_url_config.assert_not_called()
+        boto_mock.client().get_policy.assert_not_called()
+        boto_mock.client().remove_permission.assert_not_called()
+
     # Issue #1407: API Gateway v2 update returns 500 on status check
     # https://github.com/zappa/Zappa/issues/1407
     @mock.patch("botocore.client")
@@ -4490,6 +4885,42 @@ class TestZappa(unittest.TestCase):
 
         with self.assertRaises(EnvironmentError):
             zappa_core.create_handler_venv()
+
+
+class TestUploadToS3ErrorHandling(unittest.TestCase):
+    """Tests for upload_to_s3 S3 bucket error handling (#1315)"""
+
+    def setUp(self):
+        self.users_current_region_name = os.environ.get("AWS_DEFAULT_REGION", None)
+        os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+
+    def tearDown(self):
+        del os.environ["AWS_DEFAULT_REGION"]
+        if self.users_current_region_name is not None:
+            os.environ["AWS_DEFAULT_REGION"] = self.users_current_region_name
+
+    def test_upload_to_s3_raises_on_access_denied(self):
+        """upload_to_s3 should raise EnvironmentError on 403 instead of creating a new bucket."""
+        z = Zappa(runtime="python3.11")
+        error_response = {"Error": {"Code": "403", "Message": "Forbidden"}}
+        z.s3_client = mock.MagicMock()
+        z.s3_client.head_bucket.side_effect = botocore.exceptions.ClientError(error_response, "HeadBucket")
+
+        with self.assertRaises(EnvironmentError) as ctx:
+            z.upload_to_s3("/tmp/fake.zip", "my-bucket")
+        self.assertIn("Access denied", str(ctx.exception))
+        z.s3_client.create_bucket.assert_not_called()
+
+    def test_upload_to_s3_reraises_unexpected_errors(self):
+        """upload_to_s3 should re-raise unexpected ClientErrors (not 403/404)."""
+        z = Zappa(runtime="python3.11")
+        error_response = {"Error": {"Code": "500", "Message": "Internal Server Error"}}
+        z.s3_client = mock.MagicMock()
+        z.s3_client.head_bucket.side_effect = botocore.exceptions.ClientError(error_response, "HeadBucket")
+
+        with self.assertRaises(botocore.exceptions.ClientError):
+            z.upload_to_s3("/tmp/fake.zip", "my-bucket")
+        z.s3_client.create_bucket.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -20,7 +20,6 @@ import time
 import urllib
 import uuid
 import zipfile
-from builtins import bytes, int
 from io import open
 from pathlib import Path
 from typing import Iterable, Optional
@@ -74,8 +73,10 @@ FUNCTION_URL_PUBLIC_PERMISSION_RULES = (
 
 FUNCTION_URL_PUBLIC_PERMISSION_SIDS = {rule[0] for rule in FUNCTION_URL_PUBLIC_PERMISSION_RULES}
 
-# Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#apigateway_region
-API_GATEWAY_REGIONS = [
+# Latest lists:
+#   https://docs.aws.amazon.com/general/latest/gr/rande.html#apigateway_region
+#   https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region
+AWS_REGIONS = [
     "us-east-1",
     "us-east-2",
     "us-west-1",
@@ -85,7 +86,6 @@ API_GATEWAY_REGIONS = [
     "eu-west-1",
     "eu-west-2",
     "eu-west-3",
-    "eu-north-1",
     "ap-northeast-1",
     "ap-northeast-2",
     "ap-northeast-3",
@@ -100,35 +100,10 @@ API_GATEWAY_REGIONS = [
     "us-gov-east-1",
     "us-gov-west-1",
 ]
+API_GATEWAY_REGIONS = AWS_REGIONS
+LAMBDA_REGIONS = AWS_REGIONS
 
 DEFAULT_APIGATEWAY_VERSION = "v1"
-
-# Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region
-LAMBDA_REGIONS = [
-    "us-east-1",
-    "us-east-2",
-    "us-west-1",
-    "us-west-2",
-    "eu-central-1",
-    "eu-north-1",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-west-3",
-    "eu-north-1",
-    "ap-northeast-1",
-    "ap-northeast-2",
-    "ap-northeast-3",
-    "ap-southeast-1",
-    "ap-southeast-2",
-    "ap-east-1",
-    "ap-south-1",
-    "ca-central-1",
-    "cn-north-1",
-    "cn-northwest-1",
-    "sa-east-1",
-    "us-gov-east-1",
-    "us-gov-west-1",
-]
 
 # We never need to include these.
 # Related: https://github.com/Miserlou/Zappa/pull/56
@@ -601,8 +576,12 @@ class Zappa:
             else:
                 copytree(cwd, temp_project_path, metadata=False, symlinks=False)
             for glob_path in exclude_glob:
-                exclude_glob_path = temp_project_path / glob_path
-                for path in exclude_glob_path.glob("*"):
+                # Patterns must be relative because they're resolved against
+                # temp_project_path — absolute paths can't match the temp copy.
+                if Path(glob_path).is_absolute():
+                    logger.warning(f"exclude_glob: skipping absolute pattern '{glob_path}' (use relative patterns)")
+                    continue
+                for path in temp_project_path.glob(glob_path):
                     if path.exists() and path.is_file():
                         path.unlink()
                     elif path.exists() and path.is_dir():
@@ -703,8 +682,12 @@ class Zappa:
 
         # Cleanup
         for glob_path in exclude_glob:
-            exclude_glob_path = temp_project_path / glob_path
-            for path in exclude_glob_path.glob("*"):
+            # Patterns must be relative because they're resolved against
+            # temp_project_path — absolute paths can't match the temp copy.
+            if Path(glob_path).is_absolute():
+                logger.warning(f"exclude_glob: skipping absolute pattern '{glob_path}' (use relative patterns)")
+                continue
+            for path in temp_project_path.glob(glob_path):
                 if path.exists() and path.is_file():
                     path.unlink()
                 elif path.exists() and path.is_dir():
@@ -957,7 +940,15 @@ class Zappa:
         """
         try:
             self.s3_client.head_bucket(Bucket=bucket_name)
-        except botocore.exceptions.ClientError:
+        except botocore.exceptions.ClientError as e:
+            error_code = int(e.response.get("Error", {}).get("Code", 0))
+            if error_code == 403:
+                raise EnvironmentError(
+                    f"Access denied for S3 bucket '{bucket_name}'. " "Check that your IAM role has s3:ListBucket permission."
+                ) from e
+            if error_code != 404:
+                raise
+
             # This is really stupid S3 quirk. Technically, us-east-1 one has no S3,
             # it's actually "US Standard", or something.
             # More here: https://github.com/boto/boto3/issues/125
@@ -1432,9 +1423,24 @@ class Zappa:
             versions = self.lambda_client.list_versions_by_function(
                     FunctionName=function_name, Marker=versions["NextMarker"]
                 )
-            for version in versions["Versions"]:
-                versions_in_lambda.append(version["Version"])
-        return versions_in_lambda
+                for version in versions["Versions"]:
+                    versions_in_lambda.append(version["Version"])
+            versions_in_lambda.remove("$LATEST")
+            versions_to_delete = versions_in_lambda[::-1][num_revisions:]
+            if versions_to_delete:
+                logger.info(
+                    "Pruning %d Lambda function version(s) for %s (retaining latest %d): %s",
+                    len(versions_to_delete),
+                    function_name,
+                    num_revisions,
+                    ", ".join(versions_to_delete),
+                )
+            for version in versions_to_delete:
+                self.lambda_client.delete_function(FunctionName=function_name, Qualifier=version)
+
+        self.wait_until_lambda_function_is_updated(function_name)
+
+        return resource_arn
 
     def update_lambda_configuration(
         self,
@@ -1563,6 +1569,27 @@ class Zappa:
 
         if self.tags:
             self.lambda_client.tag_resource(Resource=resource_arn, Tags=self.tags)
+
+        # SnapStart only creates snapshots for versions published AFTER it's
+        # enabled. During updates, the code is published before the config is
+        # updated, so we must publish an additional version here.
+        if snap_start and snap_start != "None":
+            self.wait_until_lambda_function_is_updated(function_name)
+            logger.info("Publishing new version for SnapStart snapshot creation..")
+            publish_response = self.lambda_client.publish_version(FunctionName=function_name)
+            version = publish_response["Version"]
+
+            # Update ALB alias to point to the new version if it exists
+            try:
+                self.lambda_client.get_alias(FunctionName=function_name, Name=ALB_LAMBDA_ALIAS)
+                self.lambda_client.update_alias(
+                    FunctionName=function_name,
+                    FunctionVersion=version,
+                    Name=ALB_LAMBDA_ALIAS,
+                )
+            except botocore.exceptions.ClientError as e:
+                if "ResourceNotFoundException" not in e.response["Error"]["Code"]:
+                    raise e
 
         return resource_arn
 
@@ -1864,7 +1891,14 @@ class Zappa:
             return self.deploy_lambda_function_url(function_name, function_url_config)
 
     def delete_lambda_function_url(self, function_name):
-        response = self.lambda_client.list_function_url_configs(FunctionName=function_name, MaxItems=50)
+        try:
+            response = self.lambda_client.list_function_url_configs(FunctionName=function_name, MaxItems=50)
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] == "AccessDeniedException":
+                # Lambda Function URLs are not supported in all regions.
+                # See: https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html
+                return
+            raise
         for config in response.get("FunctionUrlConfigs", []):
             resp = self.lambda_client.delete_function_url_config(FunctionName=config["FunctionArn"])
             if resp["ResponseMetadata"]["HTTPStatusCode"] == 204:
@@ -2295,6 +2329,76 @@ class Zappa:
         self.cf_template.add_resource(permission)
 
         return http_api
+
+    def create_websocket_api(
+        self,
+        lambda_arn: str,
+        api_name: Optional[str] = None,
+        stage_name: str = "production",
+    ):
+        """
+        Create a WebSocket API Gateway for this Zappa deployment.
+        Returns the new Api CF resource.
+        """
+        import troposphere.apigatewayv2 as apigwv2
+
+        ws_api = apigwv2.Api("WsApi")
+        ws_api.Name = (api_name or lambda_arn.split(":")[-1]) + "-ws"
+        ws_api.ProtocolType = "WEBSOCKET"
+        ws_api.RouteSelectionExpression = "$request.body.action"
+        self.cf_template.add_resource(ws_api)
+
+        # Integration (AWS_PROXY for WebSocket Lambda)
+        integration = apigwv2.Integration("WsIntegration")
+        integration.ApiId = troposphere.Ref(ws_api)
+        integration.IntegrationType = "AWS_PROXY"
+        integration.IntegrationUri = troposphere.Join(
+            "",
+            [
+                "arn:aws:apigateway:",
+                troposphere.Ref("AWS::Region"),
+                ":lambda:path/2015-03-31/functions/",
+                lambda_arn,
+                "/invocations",
+            ],
+        )
+        self.cf_template.add_resource(integration)
+
+        # Routes: $connect, $disconnect, $default
+        for route_suffix, route_key in [("Connect", "$connect"), ("Disconnect", "$disconnect"), ("Default", "$default")]:
+            route = apigwv2.Route(f"Ws{route_suffix}Route")
+            route.ApiId = troposphere.Ref(ws_api)
+            route.RouteKey = route_key
+            route.Target = troposphere.Join("", ["integrations/", troposphere.Ref(integration)])
+            self.cf_template.add_resource(route)
+
+        # Stage with AutoDeploy
+        stage = apigwv2.Stage("WsStage")
+        stage.ApiId = troposphere.Ref(ws_api)
+        stage.StageName = stage_name
+        stage.AutoDeploy = True
+        self.cf_template.add_resource(stage)
+
+        # Lambda invoke permission
+        permission = troposphere.awslambda.Permission("WsInvokePermission")
+        permission.FunctionName = lambda_arn
+        permission.Action = "lambda:InvokeFunction"
+        permission.Principal = "apigateway.amazonaws.com"
+        permission.SourceArn = troposphere.Join(
+            "",
+            [
+                "arn:aws:execute-api:",
+                troposphere.Ref("AWS::Region"),
+                ":",
+                troposphere.Ref("AWS::AccountId"),
+                ":",
+                troposphere.Ref(ws_api),
+                "/*",
+            ],
+        )
+        self.cf_template.add_resource(permission)
+
+        return ws_api
 
     def create_api_gateway_routes(  # type: ignore[no-untyped-def]
         self,
@@ -2914,6 +3018,8 @@ class Zappa:
         endpoint_configuration=None,
         apigateway_version=DEFAULT_APIGATEWAY_VERSION,
         stage_name=None,
+        websocket=False,
+        websocket_stage_name=None,
     ):
         """
         Build the entire CF stack.
@@ -2951,6 +3057,14 @@ class Zappa:
             apigateway_version=apigateway_version,
             stage_name=stage_name,
         )
+
+        if websocket:
+            self.create_websocket_api(
+                lambda_arn=lambda_arn,
+                api_name=lambda_name,
+                stage_name=websocket_stage_name or stage_name or "production",
+            )
+
         return self.cf_template
 
     def update_stack(
@@ -3084,6 +3198,19 @@ class Zappa:
             return "https://{}.execute-api.{}.amazonaws.com/{}".format(api_id, self.boto_session.region_name, stage_name)
         else:
             return None
+
+    def get_websocket_url(self, lambda_name, stage_name="production"):
+        """
+        Given a lambda_name and stage_name, return the WebSocket API URL.
+        """
+        try:
+            response = self.cf_client.describe_stack_resource(StackName=lambda_name, LogicalResourceId="WsApi")
+            api_id = response["StackResourceDetail"].get("PhysicalResourceId")
+            if api_id:
+                return "wss://{}.execute-api.{}.amazonaws.com/{}".format(api_id, self.boto_session.region_name, stage_name)
+        except Exception:
+            pass
+        return None
 
     def get_api_id(self, lambda_name: str, apigateway_version: str = DEFAULT_APIGATEWAY_VERSION):
         """
