@@ -2966,7 +2966,7 @@ class Zappa:
                 user_pool,
             ),
         )
-        if result["ResponseMetadata"]["HTTPStatusCode"] != 201:
+        if result and result["ResponseMetadata"]["HTTPStatusCode"] != 201:
             logger.error("Cognito:  Failed to update lambda permission", result)
 
     def delete_stack(self, name, wait=False):
@@ -3578,19 +3578,28 @@ class Zappa:
 
         account_id: str = self.sts_client.get_caller_identity().get("Account")  # type: ignore
 
-        permission_response = self.lambda_client.add_permission(
-            FunctionName=lambda_name,
-            StatementId="zappa-" + "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8)),
-            Action="lambda:InvokeFunction",
-            Principal=principal,
-            SourceArn=source_arn,
-            # The SourceAccount argument ensures that only the specified AWS account can invoke the lambda function.
-            # This prevents a security issue where if a lambda is triggered off of s3 bucket events and the bucket is
-            # deleted, another AWS account can create a bucket with the same name and potentially trigger the original
-            # lambda function, since bucket names are global.
-            # https://github.com/zappa/Zappa/issues/1039
-            SourceAccount=account_id,
-        )
+        # Deterministic, so repeated updates reuse the statement instead of appending a new one.
+        statement_id = "zappa-" + hashlib.sha256(f"{lambda_name}:{principal}:{source_arn}".encode()).hexdigest()[:16]
+
+        try:
+            permission_response = self.lambda_client.add_permission(
+                FunctionName=lambda_name,
+                StatementId=statement_id,
+                Action="lambda:InvokeFunction",
+                Principal=principal,
+                SourceArn=source_arn,
+                # The SourceAccount argument ensures that only the specified AWS account can invoke the lambda function.
+                # This prevents a security issue where if a lambda is triggered off of s3 bucket events and the bucket is
+                # deleted, another AWS account can create a bucket with the same name and potentially trigger the original
+                # lambda function, since bucket names are global.
+                # https://github.com/zappa/Zappa/issues/1039
+                SourceAccount=account_id,
+            )
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceConflictException":
+                raise
+            logger.debug("Permission {} already present on {}".format(statement_id, lambda_name))
+            return None
 
         if permission_response["ResponseMetadata"]["HTTPStatusCode"] != 201:
             logger.error("Problem creating permission to invoke Lambda function")
